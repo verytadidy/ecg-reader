@@ -134,44 +134,37 @@ def generate_scanner_background(h, w):
 # ============================
 def sample_physical_params_v37(layout_type):
     """
-    V39 调整：
-    - 6x2 布局的增益分布被调整，以降低平均增益。
+    V43 修复：
+    - 移除 'px_per_mm' 采样 (它现在是计算值)。
+    - 保留 V39 的增益调整。
     """
     if layout_type in [LayoutType.LAYOUT_3X4_PLUS_II, LayoutType.LAYOUT_3X4]:
         gain_mm_mv = random.choice([5.0, 10.0])
     
     elif layout_type == LayoutType.LAYOUT_12X1:
-        # 真实临床分布：
-        # - 70% 使用 5mm/mV（半增益，防止重叠）
-        # - 15% 使用 10mm/mV（标准增益，可能轻微重叠）
-        # - 15% 使用 2.5mm/mV（对极端高幅度心电）
         r = random.random()
         if r < 0.70:
             gain_mm_mv = 5.0
         elif r < 0.85:
-            gain_mm_mv = 10.0  # 允许部分重叠，符合真实情况
+            gain_mm_mv = 10.0
         else:
             gain_mm_mv = 2.5
             
-    # 🔥 V39 调整：为 6x2 布局设置独立的加权增益
     elif layout_type == LayoutType.LAYOUT_6X2:
-        # 6x2 布局通常使用 10 或 5 mm/mV。20 mm/mV (双倍增益) 较少见。
-        # 50% 10mm/mV (标准)
-        # 40% 5mm/mV (半增益)
-        # 10% 20mm/mV (双倍增益)
         gain_mm_mv = random.choices([10.0, 5.0, 20.0], weights=[0.50, 0.40, 0.10], k=1)[0]
         
     else:
-        # 默认/回退 (等同于 3x4)
         gain_mm_mv = random.choice([5.0, 10.0])
     
+    # 纸速仍然是唯一的尺度增强来源
     paper_speed_mm_s = random.choice([25.0, 50.0])
-    px_per_mm = random.uniform(18.0, 22.0)
+    
+    # 🔥 V43 修复：不再采样 px_per_mm
     
     return {
         'paper_speed_mm_s': paper_speed_mm_s,
         'gain_mm_mv': gain_mm_mv,
-        'px_per_mm': px_per_mm,
+        # 'px_per_mm': px_per_mm, # <- 移除
         'lead_durations': {
             'long': 10.0,
             'short': 2.5
@@ -201,216 +194,193 @@ def render_calibration_pulse(img, alpha_other, x_start, y_baseline, px_per_mm, p
     cv2.polylines(alpha_other, [pts], False, 255, thick, cv2.LINE_AA)
     return x_end
 
-# 🔥 修改： 'alpha_waveform' -> 'wave_label_semantic_mask'
-def render_layout_3x4_v37(df, sig_rgb, wave_label_semantic_mask, alpha_other, alpha_baseline, h, w, params, ink_color, font_face, fs, sig_len):
-    """V38 新增：3x4 纯网格布局（不带底部长导联）"""
-    px_per_mm = params['px_per_mm']
-    px_per_mv = params['gain_mm_mv'] * px_per_mm
-    paper_speed = params['paper_speed_mm_s']
-    MT = int(150 * (h/1700))
-    MB = int(100 * (h/1700))
-    ML = int(10*px_per_mm)
-    MR = int(10*px_per_mm)
-    
-    lead_in_area = int(random.uniform(12.0, 18.0) * px_per_mm)
-    signal_start_x = ML + lead_in_area
-    signal_draw_w = w - signal_start_x - MR
-    
-    PAPER_DURATION_S = 10.0
-    px_per_s_on_paper = signal_draw_w / PAPER_DURATION_S
-    
-    # 🔥 关键区别：不分配空间给长导联，3行平分整个高度
-    main_h = h - MT - MB  # 使用全部可用高度
-    row_h = main_h / 3    # 3行平分
+def render_layout_3x4_v37(df, sig_rgb, wave_label_semantic_mask, alpha_other, baseline_heatmaps, params, ink_color, font_face, fs, sig_len, render_params):
+    """V43 修复：使用传入的 render_params (有效标尺)"""
+    # 解包 V43 渲染参数
+    h, w = render_params['h'], render_params['w']
+    MT_px = render_params['MT_px']
+    signal_start_x = render_params['signal_start_x']
+    px_per_s_on_paper = render_params['px_per_s_on_paper']
+    effective_px_per_mm = render_params['effective_px_per_mm']
+    effective_px_per_mv = render_params['effective_px_per_mv']
+
+    main_h = h - MT_px - render_params['MB_px']
+    row_h = main_h / 3
     TIME_PER_COL_ON_PAPER = 2.5
     
     thick_signal = random.randint(1, 2)
     thick_pulse = thick_signal + 1
     thick_separator = thick_pulse + 1
     font_scale = random.uniform(0.9, 1.2)
-    x_pulse_start_common = int(signal_start_x - random.uniform(10.0, 12.0) * px_per_mm)
     
-    # 绘制 3 个定标脉冲
+    # 🔥 V43 修复：使用 effective_px_per_mm
+    x_pulse_start_common = int(signal_start_x - random.uniform(10.0, 12.0) * effective_px_per_mm)
+    
     x_pulse_end_main_grid = 0
     for r in range(3):
-        base_y = int(MT + (r + 0.5) * row_h)
-        _x_end = render_calibration_pulse(sig_rgb, alpha_other, x_pulse_start_common, base_y, px_per_mm, px_per_mv, paper_speed, ink_color, thick_pulse)
+        base_y = int(MT_px + (r + 0.5) * row_h)
+        # 🔥 V43 修复：使用 effective 标尺
+        _x_end = render_calibration_pulse(sig_rgb, alpha_other, x_pulse_start_common, base_y, 
+                                        effective_px_per_mm, effective_px_per_mv, 
+                                        params['paper_speed_mm_s'], ink_color, thick_pulse)
         x_pulse_end_main_grid = max(x_pulse_end_main_grid, _x_end)
     
     total_samples_10s = min(len(df), int(fs * 10.0))
     
-    # 绘制 12 个短导联（与 3x4+1 相同）
     for lead, (r, c) in LAYOUT_CONFIGS[LayoutType.LAYOUT_3X4]['leads'].items():
         if lead not in df.columns: 
             continue
-        base_y = int(MT + (r + 0.5) * row_h)
+        base_y = int(MT_px + (r + 0.5) * row_h)
         
         t_start_plot = c * TIME_PER_COL_ON_PAPER
         t_end_plot = (c + 1) * TIME_PER_COL_ON_PAPER
         
         idx_start = int(t_start_plot * fs)
         idx_end = min(int(t_end_plot * fs), total_samples_10s)
-        
         sig = df[lead].iloc[idx_start:idx_end].dropna().values
         
         x_start_line = int(signal_start_x + t_start_plot * px_per_s_on_paper)
         x_end_line = int(signal_start_x + t_end_plot * px_per_s_on_paper)
-        cv2.line(alpha_baseline, (x_start_line, base_y), (x_end_line, base_y), 255, thick_signal, cv2.LINE_AA)
+        
+        lead_id = LEAD_TO_ID_MAP.get(lead)
+        if lead_id:
+            cv2.line(baseline_heatmaps[lead_id - 1], (x_start_line, base_y), (x_end_line, base_y), 255, thick_signal, cv2.LINE_AA)
         
         if len(sig) > 0:
             t_axis_plot = np.linspace(t_start_plot, t_end_plot, len(sig))
             xs = signal_start_x + t_axis_plot * px_per_s_on_paper
-            ys = base_y - sig * px_per_mv
+            # 🔥 V43 修复：使用 effective_px_per_mv
+            ys = base_y - sig * effective_px_per_mv
             xs = np.clip(xs, 0, w - 1)
             pts = np.stack([xs, ys], axis=1).astype(np.int32).reshape((-1, 1, 2))
             cv2.polylines(sig_rgb, [pts], False, ink_color, thick_signal, cv2.LINE_AA)
-            
-            # 🔥 修改：使用 'lead_id' 绘制到 'wave_label_semantic_mask'
-            if lead in LEAD_TO_ID_MAP:
-                lead_id = LEAD_TO_ID_MAP[lead]
+            if lead_id:
                 cv2.polylines(wave_label_semantic_mask, [pts], False, lead_id, thick_signal, cv2.LINE_AA)
         
         txt_y = int(base_y - row_h * 0.3)
+        # 🔥 V43 修复：使用 effective_px_per_mm
         txt_x_gap_mm = random.uniform(2.0, 5.0)
-        txt_x_base = int(x_pulse_end_main_grid + txt_x_gap_mm * px_per_mm)
+        txt_x_base = int(x_pulse_end_main_grid + txt_x_gap_mm * effective_px_per_mm)
         if c == 0: 
             txt_x = txt_x_base
         else: 
-            txt_x = int(signal_start_x + (c * TIME_PER_COL_ON_PAPER) * px_per_s_on_paper + random.uniform(2, 4)*px_per_mm)
+            txt_x = int(signal_start_x + (c * TIME_PER_COL_ON_PAPER) * px_per_s_on_paper + random.uniform(2, 4) * effective_px_per_mm)
         txt_x = max(0, min(txt_x, w - 1))
         txt_y = max(10, min(txt_y, h - 1))
         cv2.putText(sig_rgb, lead, (txt_x, txt_y), font_face, font_scale, ink_color, 2, cv2.LINE_AA)
         cv2.putText(alpha_other, lead, (txt_x, txt_y), font_face, font_scale, 255, 2, cv2.LINE_AA)
     
-    # 列分隔符
-    tick_h_half = int(2.5 * px_per_mm)
-    # 50% 几率悬浮, 50% 几率在基线
+    # 🔥 V43 修复：使用 effective_px_per_mm
+    tick_h_half = int(2.5 * effective_px_per_mm)
     separator_style = random.choice(['centered', 'floating']) 
-    
     for c in range(1, 4):
         sep_x = int(signal_start_x + (c * TIME_PER_COL_ON_PAPER) * px_per_s_on_paper)
         for r in range(3):
-            base_y = int(MT + (r + 0.5) * row_h)
-            
-            # 🔥 V39 调整：根据风格计算y坐标
+            base_y = int(MT_px + (r + 0.5) * row_h)
             if separator_style == 'centered':
                 y_center = base_y
-            else: # 'floating'
-                # 放置在行高顶部 25% 的位置 (靠近文字标签)
-                y_center = int(MT + (r * row_h) + row_h * 0.25) 
-            
+            else:
+                y_center = int(MT_px + (r * row_h) + row_h * 0.25) 
             y1 = y_center - tick_h_half
             y2 = y_center + tick_h_half
-                
             pts_tick = np.array([[sep_x, y1], [sep_x, y2]], dtype=np.int32).reshape((-1, 1, 2))
             cv2.polylines(sig_rgb, [pts_tick], False, ink_color, thick_separator, cv2.LINE_AA)
             cv2.polylines(alpha_other, [pts_tick], False, 255, thick_separator, cv2.LINE_AA)
 
 # 🔥 修改： 'alpha_waveform' -> 'wave_label_semantic_mask'
-def render_layout_3x4_plus_II_v37(df, sig_rgb, wave_label_semantic_mask, alpha_other, alpha_baseline, h, w, params, ink_color, font_face, fs, sig_len):
-    """V37 修正：使用真实 fs 和 sig_len"""
-    px_per_mm = params['px_per_mm']
-    px_per_mv = params['gain_mm_mv'] * px_per_mm
-    paper_speed = params['paper_speed_mm_s']
-    MT = int(150 * (h/1700))
-    MB = int(100 * (h/1700))
-    ML = int(10*px_per_mm)
-    MR = int(10*px_per_mm)
-    
-    lead_in_area = int(random.uniform(12.0, 18.0) * px_per_mm)
-    signal_start_x = ML + lead_in_area
-    signal_draw_w = w - signal_start_x - MR
-    
-    PAPER_DURATION_S = 10.0
-    px_per_s_on_paper = signal_draw_w / PAPER_DURATION_S
-    
-    main_h = (h - MT - MB) * 0.75
-    rhythm_h = (h - MT - MB) * 0.25
+def render_layout_3x4_plus_II_v37(df, sig_rgb, wave_label_semantic_mask, alpha_other, baseline_heatmaps, params, ink_color, font_face, fs, sig_len, render_params):
+    """V43.2 修复：使用传入的 render_params (有效标尺) + 修复长导联bug"""
+    # 解包 V43 渲染参数
+    h, w = render_params['h'], render_params['w']
+    MT_px = render_params['MT_px']
+    signal_start_x = render_params['signal_start_x']
+    signal_draw_w_px = render_params['signal_draw_w_px']
+    px_per_s_on_paper = render_params['px_per_s_on_paper']
+    effective_px_per_mm = render_params['effective_px_per_mm']
+    effective_px_per_mv = render_params['effective_px_per_mv']
+
+    main_h = (h - MT_px - render_params['MB_px']) * 0.75
+    rhythm_h = (h - MT_px - render_params['MB_px']) * 0.25
     row_h = main_h / 3
-    TIME_PER_COL_ON_PAPER = 2.5  # 固定 2.5 秒每列
+    TIME_PER_COL_ON_PAPER = 2.5
     
     thick_signal = random.randint(1, 2)
     thick_pulse = thick_signal + 1
     thick_separator = thick_pulse + 1
     font_scale = random.uniform(0.9, 1.2)
-    x_pulse_start_common = int(signal_start_x - random.uniform(10.0, 12.0) * px_per_mm)
     
-    # 定标脉冲
+    x_pulse_start_common = int(signal_start_x - random.uniform(10.0, 12.0) * effective_px_per_mm)
+    
     x_pulse_end_main_grid = 0
     for r in range(3):
-        base_y = int(MT + (r + 0.5) * row_h)
-        _x_end = render_calibration_pulse(sig_rgb, alpha_other, x_pulse_start_common, base_y, px_per_mm, px_per_mv, paper_speed, ink_color, thick_pulse)
+        base_y = int(MT_px + (r + 0.5) * row_h)
+        _x_end = render_calibration_pulse(sig_rgb, alpha_other, x_pulse_start_common, base_y, 
+                                        effective_px_per_mm, effective_px_per_mv, 
+                                        params['paper_speed_mm_s'], ink_color, thick_pulse)
         x_pulse_end_main_grid = max(x_pulse_end_main_grid, _x_end)
-    base_y_long_lead = int(MT + main_h + rhythm_h / 2)
-    x_pulse_end_long_lead = render_calibration_pulse(sig_rgb, alpha_other, x_pulse_start_common, base_y_long_lead, px_per_mm, px_per_mv, paper_speed, ink_color, thick_pulse)
+        
+    base_y_long_lead = int(MT_px + main_h + rhythm_h / 2)
+    x_pulse_end_long_lead = render_calibration_pulse(sig_rgb, alpha_other, x_pulse_start_common, base_y_long_lead, 
+                                                   effective_px_per_mm, effective_px_per_mv, 
+                                                   params['paper_speed_mm_s'], ink_color, thick_pulse)
     
-    # V37 修正：使用真实 fs
     total_samples_10s = min(len(df), int(fs * 10.0))
     
-    # 绘制 12 个短导联
+    # 绘制 12 个短导联 (这部分没有 bug)
     for lead, (r, c) in LAYOUT_CONFIGS[LayoutType.LAYOUT_3X4_PLUS_II]['leads'].items():
         if lead not in df.columns: 
             continue
-        base_y = int(MT + (r + 0.5) * row_h)
+        base_y = int(MT_px + (r + 0.5) * row_h)
         
         t_start_plot = c * TIME_PER_COL_ON_PAPER
         t_end_plot = (c + 1) * TIME_PER_COL_ON_PAPER
         
-        # V37 修正：基于真实 fs 计算索引
         idx_start = int(t_start_plot * fs)
         idx_end = min(int(t_end_plot * fs), total_samples_10s)
-        
         sig = df[lead].iloc[idx_start:idx_end].dropna().values
         
         x_start_line = int(signal_start_x + t_start_plot * px_per_s_on_paper)
         x_end_line = int(signal_start_x + t_end_plot * px_per_s_on_paper)
-        cv2.line(alpha_baseline, (x_start_line, base_y), (x_end_line, base_y), 255, thick_signal, cv2.LINE_AA)
+        
+        lead_id = LEAD_TO_ID_MAP.get(lead)
+        if lead_id:
+            cv2.line(baseline_heatmaps[lead_id - 1], (x_start_line, base_y), (x_end_line, base_y), 255, thick_signal, cv2.LINE_AA)
         
         if len(sig) > 0:
             t_axis_plot = np.linspace(t_start_plot, t_end_plot, len(sig))
             xs = signal_start_x + t_axis_plot * px_per_s_on_paper
-            ys = base_y - sig * px_per_mv
+            ys = base_y - sig * effective_px_per_mv # <--- 这里使用 'sig' 是正确的
             xs = np.clip(xs, 0, w - 1)
             pts = np.stack([xs, ys], axis=1).astype(np.int32).reshape((-1, 1, 2))
             cv2.polylines(sig_rgb, [pts], False, ink_color, thick_signal, cv2.LINE_AA)
-
-            # 🔥 修改：使用 'lead_id' 绘制到 'wave_label_semantic_mask'
-            if lead in LEAD_TO_ID_MAP:
-                lead_id = LEAD_TO_ID_MAP[lead]
+            if lead_id:
                 cv2.polylines(wave_label_semantic_mask, [pts], False, lead_id, thick_signal, cv2.LINE_AA)
         
         txt_y = int(base_y - row_h * 0.3)
         txt_x_gap_mm = random.uniform(2.0, 5.0)
-        txt_x_base = int(x_pulse_end_main_grid + txt_x_gap_mm * px_per_mm)
+        txt_x_base = int(x_pulse_end_main_grid + txt_x_gap_mm * effective_px_per_mm)
         if c == 0: 
             txt_x = txt_x_base
         else: 
-            txt_x = int(signal_start_x + (c * TIME_PER_COL_ON_PAPER) * px_per_s_on_paper + random.uniform(2, 4)*px_per_mm)
+            txt_x = int(signal_start_x + (c * TIME_PER_COL_ON_PAPER) * px_per_s_on_paper + random.uniform(2, 4) * effective_px_per_mm)
         txt_x = max(0, min(txt_x, w - 1))
         txt_y = max(10, min(txt_y, h - 1))
         cv2.putText(sig_rgb, lead, (txt_x, txt_y), font_face, font_scale, ink_color, 2, cv2.LINE_AA)
         cv2.putText(alpha_other, lead, (txt_x, txt_y), font_face, font_scale, 255, 2, cv2.LINE_AA)
-    
-    # 🔥 ：列分隔符
-    tick_h_half = int(2.5 * px_per_mm)
-    # 50% 几率悬浮, 50% 几率在基线
+
+    # 列分隔符 (这部分没有 bug)
+    tick_h_half = int(2.5 * effective_px_per_mm)
     separator_style = random.choice(['centered', 'floating'])
-    
     for c in range(1, 4):
         sep_x = int(signal_start_x + (c * TIME_PER_COL_ON_PAPER) * px_per_s_on_paper)
         for r in range(3):
-            base_y = int(MT + (r + 0.5) * row_h)
-
-            # 🔥 V39 调整：根据风格计算y坐标
+            base_y = int(MT_px + (r + 0.5) * row_h)
             if separator_style == 'centered':
                 y_center = base_y
-            else: # 'floating'
-                # 放置在行高顶部 25% 的位置 (靠近文字标签)
-                y_center = int(MT + (r * row_h) + row_h * 0.25)
-            
+            else:
+                y_center = int(MT_px + (r * row_h) + row_h * 0.25)
             y1 = y_center - tick_h_half
             y2 = y_center + tick_h_half
-                
             pts_tick = np.array([[sep_x, y1], [sep_x, y2]], dtype=np.int32).reshape((-1, 1, 2))
             cv2.polylines(sig_rgb, [pts_tick], False, ink_color, thick_separator, cv2.LINE_AA)
             cv2.polylines(alpha_other, [pts_tick], False, 255, thick_separator, cv2.LINE_AA)
@@ -418,108 +388,93 @@ def render_layout_3x4_plus_II_v37(df, sig_rgb, wave_label_semantic_mask, alpha_o
     # 长导联 (Lead II, 10秒)
     long_lead = LAYOUT_CONFIGS[LayoutType.LAYOUT_3X4_PLUS_II]['long_lead']
     if long_lead and long_lead in df.columns:
-        base_y = int(MT + main_h + rhythm_h / 2)
-        txt_x = int(x_pulse_end_long_lead + random.uniform(2, 4) * px_per_mm)
+        base_y = int(MT_px + main_h + rhythm_h / 2)
+        txt_x = int(x_pulse_end_long_lead + random.uniform(2, 4) * effective_px_per_mm)
         txt_y = int(base_y - rhythm_h * 0.3)
         txt_x = max(0, min(txt_x, w - 1))
         txt_y = max(10, min(txt_y, h - 1))
         cv2.putText(sig_rgb, long_lead, (txt_x, txt_y), font_face, font_scale, ink_color, 2, cv2.LINE_AA)
         cv2.putText(alpha_other, long_lead, (txt_x, txt_y), font_face, font_scale, 255, 2, cv2.LINE_AA)
-        cv2.line(alpha_baseline, (signal_start_x, base_y), (signal_start_x + signal_draw_w, base_y), 255, thick_signal, cv2.LINE_AA)
         
-        # V37 修正：使用真实 fs
+        lead_id = LEAD_TO_ID_MAP.get(long_lead)
+        if lead_id:
+             cv2.line(baseline_heatmaps[lead_id - 1], (signal_start_x, base_y), (signal_start_x + signal_draw_w_px, base_y), 255, thick_signal, cv2.LINE_AA)
+        
         idx_start = 0
         idx_end = min(int(10.0 * fs), total_samples_10s)
         sig_full = df[long_lead].iloc[idx_start:idx_end].dropna().values
+        
         if len(sig_full) > 0:
             t_axis_plot = np.linspace(0, 10.0, len(sig_full))
             xs = signal_start_x + t_axis_plot * px_per_s_on_paper
-            ys = base_y - sig_full * px_per_mv
+            
+            # 🔥 V43.2 修复：使用 'sig_full' 而不是 'sig'
+            ys = base_y - sig_full * effective_px_per_mv 
+            
             xs = np.clip(xs, 0, w - 1)
             pts = np.stack([xs, ys], axis=1).astype(np.int32).reshape((-1, 1, 2))
             cv2.polylines(sig_rgb, [pts], False, ink_color, thick_signal, cv2.LINE_AA)
-            
-            # 🔥 修改：使用 'lead_id' 绘制到 'wave_label_semantic_mask' (长导联)
-            if long_lead in LEAD_TO_ID_MAP:
-                lead_id = LEAD_TO_ID_MAP[long_lead]
+            if lead_id:
                 cv2.polylines(wave_label_semantic_mask, [pts], False, lead_id, thick_signal, cv2.LINE_AA)
 
 # 🔥 修改： 'alpha_waveform' -> 'wave_label_semantic_mask'
-def render_layout_6x2_v37(df, sig_rgb, wave_label_semantic_mask, alpha_other, alpha_baseline, h, w, params, ink_color, font_face, fs, sig_len):
-    """V38 修复版本：
-    1. 添加列分隔符（在第2列开始前）
-    2. 修复导联名称位置，让它们分别显示在各自导联附近
-    3. 引入位置随机化
-    """
-    px_per_mm = params['px_per_mm']
-    px_per_mv = params['gain_mm_mv'] * px_per_mm
-    paper_speed = params['paper_speed_mm_s']
-    MT = int(100 * (h/1700))
-    MB = int(100 * (h/1700))
-    ML = int(10*px_per_mm)
-    MR = int(10*px_per_mm)
-    
-    lead_in_area = int(random.uniform(12.0, 18.0) * px_per_mm)
-    signal_start_x = ML + lead_in_area
-    signal_draw_w = w - signal_start_x - MR
-    PAPER_DURATION_S = 10.0
-    px_per_s_on_paper = signal_draw_w / PAPER_DURATION_S
-    row_h = (h - MT - MB) / 6.0
-    col_w = signal_draw_w / 2.0
+def render_layout_6x2_v37(df, sig_rgb, wave_label_semantic_mask, alpha_other, baseline_heatmaps, params, ink_color, font_face, fs, sig_len, render_params):
+    """V43 修复：使用传入的 render_params (有效标尺)"""
+    # 解包 V43 渲染参数
+    h, w = render_params['h'], render_params['w']
+    MT_px = render_params['MT_px']
+    signal_start_x = render_params['signal_start_x']
+    px_per_s_on_paper = render_params['px_per_s_on_paper']
+    effective_px_per_mm = render_params['effective_px_per_mm']
+    effective_px_per_mv = render_params['effective_px_per_mv']
+
+    row_h = (h - MT_px - render_params['MB_px']) / 6.0
     TIME_PER_COL_ON_PAPER = 5.0
+    col_w_px = TIME_PER_COL_ON_PAPER * px_per_s_on_paper
     
     thick_signal = random.randint(1, 2)
     thick_pulse = thick_signal + 1
     thick_separator = thick_pulse + 1
     font_scale = random.uniform(1.0, 1.3)
     
-    x_pulse_start_common = int(signal_start_x - random.uniform(10.0, 12.0) * px_per_mm)
+    # 🔥 V43 修复：使用 effective_px_per_mm
+    x_pulse_start_common = int(signal_start_x - random.uniform(10.0, 12.0) * effective_px_per_mm)
     
-    # 每行都绘制定标脉冲
     x_pulse_end_max = 0
     for r in range(6):
-        base_y = int(MT + (r + 0.5) * row_h)
+        base_y = int(MT_px + (r + 0.5) * row_h)
+        # 🔥 V43 修复：使用 effective 标尺
         x_pulse_end = render_calibration_pulse(
             sig_rgb, alpha_other, x_pulse_start_common, base_y, 
-            px_per_mm, px_per_mv, paper_speed, ink_color, thick_pulse
+            effective_px_per_mm, effective_px_per_mv, 
+            params['paper_speed_mm_s'], ink_color, thick_pulse
         )
         x_pulse_end_max = max(x_pulse_end_max, x_pulse_end)
     
-    # 列分隔符
     sep_x = int(signal_start_x + TIME_PER_COL_ON_PAPER * px_per_s_on_paper)
-    tick_h_half = int(2.5 * px_per_mm)
-    # 50% 几率悬浮, 50% 几率在基线
+    # 🔥 V43 修复：使用 effective_px_per_mm
+    tick_h_half = int(2.5 * effective_px_per_mm)
     separator_style = random.choice(['centered', 'floating'])
     
     for r in range(6):
-        base_y = int(MT + (r + 0.5) * row_h)
-        
-        #  调整：根据风格计算y坐标
+        base_y = int(MT_px + (r + 0.5) * row_h)
         if separator_style == 'centered':
             y_center = base_y
-        else: # 'floating'
-            # 放置在行高顶部 25% 的位置 (靠近文字标签)
-            y_center = int(MT + (r * row_h) + row_h * 0.25)
-        
+        else:
+            y_center = int(MT_px + (r * row_h) + row_h * 0.25)
         y1 = y_center - tick_h_half
         y2 = y_center + tick_h_half
-            
-        pts_tick = np.array([
-            [sep_x, y1], 
-            [sep_x, y2]
-        ], dtype=np.int32).reshape((-1, 1, 2))
+        pts_tick = np.array([[sep_x, y1], [sep_x, y2]], dtype=np.int32).reshape((-1, 1, 2))
         cv2.polylines(sig_rgb, [pts_tick], False, ink_color, thick_separator, cv2.LINE_AA)
         cv2.polylines(alpha_other, [pts_tick], False, 255, thick_separator, cv2.LINE_AA)
     
-    # 获取真实信号长度
     total_samples_10s = min(len(df), int(fs * 10.0))
     
-    # 绘制12个导联
     for lead, (r, c) in LAYOUT_CONFIGS[LayoutType.LAYOUT_6X2]['leads'].items():
         if lead not in df.columns: 
             continue
         
-        base_y = int(MT + (r + 0.5) * row_h)
+        base_y = int(MT_px + (r + 0.5) * row_h)
         t_start_plot = c * TIME_PER_COL_ON_PAPER
         t_end_plot = (c + 1) * TIME_PER_COL_ON_PAPER
         
@@ -527,98 +482,83 @@ def render_layout_6x2_v37(df, sig_rgb, wave_label_semantic_mask, alpha_other, al
         idx_end = min(int(t_end_plot * fs), total_samples_10s)
         sig = df[lead].iloc[idx_start:idx_end].dropna().values
         
-        # 计算该导联所在列的实际绘制范围
-        x_start_line = int(signal_start_x + c * col_w)
-        x_end_line = int(signal_start_x + (c + 1) * col_w)
-        cv2.line(alpha_baseline, (x_start_line, base_y), (x_end_line, base_y), 255, thick_signal, cv2.LINE_AA)
+        x_start_line = int(signal_start_x + c * col_w_px)
+        x_end_line = int(signal_start_x + (c + 1) * col_w_px)
         
-        # 绘制波形
+        lead_id = LEAD_TO_ID_MAP.get(lead)
+        if lead_id:
+            cv2.line(baseline_heatmaps[lead_id - 1], (x_start_line, base_y), (x_end_line, base_y), 255, thick_signal, cv2.LINE_AA)
+        
         if len(sig) > 0:
             t_axis_plot = np.linspace(t_start_plot, t_end_plot, len(sig))
             xs = signal_start_x + t_axis_plot * px_per_s_on_paper
-            ys = base_y - sig * px_per_mv
+            # 🔥 V43 修复：使用 effective_px_per_mv
+            ys = base_y - sig * effective_px_per_mv
             xs = np.clip(xs, 0, w - 1)
             pts = np.stack([xs, ys], axis=1).astype(np.int32).reshape((-1, 1, 2))
             cv2.polylines(sig_rgb, [pts], False, ink_color, thick_signal, cv2.LINE_AA)
-
-            # 🔥 修改：使用 'lead_id' 绘制到 'wave_label_semantic_mask'
-            if lead in LEAD_TO_ID_MAP:
-                lead_id = LEAD_TO_ID_MAP[lead]
+            if lead_id:
                 cv2.polylines(wave_label_semantic_mask, [pts], False, lead_id, thick_signal, cv2.LINE_AA)
         
-        # 🔥 修复2: 导联标签位置优化
-        # 垂直位置：在该行上方，增加随机偏移
         txt_y_base = int(base_y - row_h * 0.25)
-        txt_y_offset = random.uniform(-row_h * 0.05, row_h * 0.05)  # 上下浮动5%行高
+        txt_y_offset = random.uniform(-row_h * 0.05, row_h * 0.05)
         txt_y = int(txt_y_base + txt_y_offset)
         
-        # 水平位置：根据所在列决定
         if c == 0:
-            # 第一列：定标脉冲后方
-            txt_x_base = int(x_pulse_end_max + random.uniform(2.0, 4.0) * px_per_mm)
-            txt_x_offset = random.uniform(0, 2.0 * px_per_mm)  # 向右随机偏移
+            # 🔥 V43 修复：使用 effective_px_per_mm
+            txt_x_base = int(x_pulse_end_max + random.uniform(2.0, 4.0) * effective_px_per_mm)
+            txt_x_offset = random.uniform(0, 2.0 * effective_px_per_mm)
         else:
-            # 第二列：该列信号开始后一段距离
-            txt_x_base = int(signal_start_x + c * col_w + random.uniform(2.0, 5.0) * px_per_mm)
-            txt_x_offset = random.uniform(0, 2.0 * px_per_mm)  # 向右随机偏移
+            # 🔥 V43 修复：使用 effective_px_per_mm
+            txt_x_base = int(signal_start_x + c * col_w_px + random.uniform(2.0, 5.0) * effective_px_per_mm)
+            txt_x_offset = random.uniform(0, 2.0 * effective_px_per_mm)
         
         txt_x = int(txt_x_base + txt_x_offset)
-        
-        # 确保坐标在有效范围内
-        txt_x = max(0, min(txt_x, w - 50))  # 留出文字宽度
+        txt_x = max(0, min(txt_x, w - 50))
         txt_y = max(10, min(txt_y, h - 10))
         
-        # 绘制导联标签
         cv2.putText(sig_rgb, lead, (txt_x, txt_y), font_face, font_scale, ink_color, 2, cv2.LINE_AA)
         cv2.putText(alpha_other, lead, (txt_x, txt_y), font_face, font_scale, 255, 2, cv2.LINE_AA)
 
 # 🔥 修改： 'alpha_waveform' -> 'wave_label_semantic_mask'
-def render_layout_12x1_v37(df, sig_rgb, wave_label_semantic_mask, alpha_other, alpha_baseline, h, w, params, ink_color, font_face, fs, sig_len):
-    """
-    V38 真实版本：
-    - 不额外缩放波形（临床上通过调整 mm/mV 而非事后缩放）
-    - 允许极端情况下波形与上下行轻微重叠（真实场景）
-    - 定标脉冲使用实际增益值（不缩放）
-    """
-    px_per_mm = params['px_per_mm']
-    px_per_mv = params['gain_mm_mv'] * px_per_mm
-    paper_speed = params['paper_speed_mm_s']
-    MT = int(100 * (h/1700))
-    MB = int(100 * (h/1700))
-    ML = int(10*px_per_mm)
-    MR = int(10*px_per_mm)
+def render_layout_12x1_v37(df, sig_rgb, wave_label_semantic_mask, alpha_other, baseline_heatmaps, params, ink_color, font_face, fs, sig_len, render_params):
+    """V43 修复：使用传入的 render_params (有效标尺)"""
+    # 解包 V43 渲染参数
+    h, w = render_params['h'], render_params['w']
+    MT_px = render_params['MT_px']
+    signal_start_x = render_params['signal_start_x']
+    signal_draw_w_px = render_params['signal_draw_w_px']
+    px_per_s_on_paper = render_params['px_per_s_on_paper']
+    effective_px_per_mm = render_params['effective_px_per_mm']
+    effective_px_per_mv = render_params['effective_px_per_mv']
     
-    lead_in_area = int(random.uniform(12.0, 18.0) * px_per_mm)
-    signal_start_x = ML + lead_in_area
-    signal_draw_w = w - signal_start_x - MR
-    row_h = (h - MT - MB) / 12.0
-    PAPER_DURATION_S = 10.0
-    px_per_s_on_paper = signal_draw_w / PAPER_DURATION_S
+    row_h = (h - MT_px - render_params['MB_px']) / 12.0
     
     thick_signal = random.randint(1, 2)
     thick_pulse = thick_signal + 1
     font_scale = random.uniform(0.8, 1.0)
-    x_pulse_start_common = int(signal_start_x - random.uniform(10.0, 12.0) * px_per_mm)
     
-    # 🔥 关键：定标脉冲使用实际增益（不缩放）
+    # 🔥 V43 修复：使用 effective_px_per_mm
+    x_pulse_start_common = int(signal_start_x - random.uniform(10.0, 12.0) * effective_px_per_mm)
+    
     x_pulse_end_max = 0
     for r in range(12):
-        base_y = int(MT + (r + 0.5) * row_h)
+        base_y = int(MT_px + (r + 0.5) * row_h)
+        # 🔥 V43 修复：使用 effective 标尺
         x_pulse_end = render_calibration_pulse(
             sig_rgb, alpha_other, x_pulse_start_common, base_y, 
-            px_per_mm, px_per_mv, paper_speed, ink_color, thick_pulse
+            effective_px_per_mm, effective_px_per_mv, 
+            params['paper_speed_mm_s'], ink_color, thick_pulse
         )
         x_pulse_end_max = max(x_pulse_end_max, x_pulse_end)
-    
     
     total_samples_10s = min(len(df), int(fs * 10.0))
     lead_order = ['I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6']
     
-    # 🔥 关键：波形也使用实际增益（允许重叠）
     for r, lead in enumerate(lead_order):
         if lead not in df.columns: 
             continue
-        base_y = int(MT + (r + 0.5) * row_h)
+        base_y = int(MT_px + (r + 0.5) * row_h)
         
         t_start_plot = 0.0
         t_end_plot = 10.0
@@ -627,44 +567,78 @@ def render_layout_12x1_v37(df, sig_rgb, wave_label_semantic_mask, alpha_other, a
         idx_end = total_samples_10s
         sig = df[lead].iloc[idx_start:idx_end].dropna().values
         
-        # 绘制基线
         x_start_line = signal_start_x
-        x_end_line = signal_start_x + signal_draw_w
-        cv2.line(alpha_baseline, (x_start_line, base_y), (x_end_line, base_y), 255, thick_signal, cv2.LINE_AA)
+        x_end_line = signal_start_x + signal_draw_w_px
         
-        # 绘制波形（使用实际增益，不额外缩放）
+        lead_id = LEAD_TO_ID_MAP.get(lead)
+        if lead_id:
+            cv2.line(baseline_heatmaps[lead_id - 1], (x_start_line, base_y), (x_end_line, base_y), 255, thick_signal, cv2.LINE_AA)
+        
         if len(sig) > 0:
             t_axis_plot = np.linspace(t_start_plot, t_end_plot, len(sig))
             xs = signal_start_x + t_axis_plot * px_per_s_on_paper
-            ys = base_y - sig * px_per_mv  # 🔥 使用原始增益，不缩放
+            # 🔥 V43 修复：使用 effective_px_per_mv
+            ys = base_y - sig * effective_px_per_mv
             xs = np.clip(xs, 0, w - 1)
-            # ⚠️ 不裁剪 ys，允许波形超出行高范围（真实情况）
             pts = np.stack([xs, ys], axis=1).astype(np.int32).reshape((-1, 1, 2))
             cv2.polylines(sig_rgb, [pts], False, ink_color, thick_signal, cv2.LINE_AA)
-            
-            # 🔥 修改：使用 'lead_id' 绘制到 'wave_label_semantic_mask'
-            if lead in LEAD_TO_ID_MAP:
-                lead_id = LEAD_TO_ID_MAP[lead]
+            if lead_id:
                 cv2.polylines(wave_label_semantic_mask, [pts], False, lead_id, thick_signal, cv2.LINE_AA)
         
-        # 绘制导联标签
         txt_y = int(base_y - row_h * 0.2)
+        # 🔥 V43 修复：使用 effective_px_per_mm
         txt_x_gap_mm = random.uniform(2.0, 5.0)
-        txt_x = int(x_pulse_end_max + txt_x_gap_mm * px_per_mm)
+        txt_x = int(x_pulse_end_max + txt_x_gap_mm * effective_px_per_mm)
         txt_x = max(0, min(txt_x, w - 1))
         txt_y = max(10, min(txt_y, h - 1))
         cv2.putText(sig_rgb, lead, (txt_x, txt_y), font_face, font_scale, ink_color, 2, cv2.LINE_AA)
         cv2.putText(alpha_other, lead, (txt_x, txt_y), font_face, font_scale, 255, 2, cv2.LINE_AA)
 
-
 # ============================
 # 5. 主渲染函数 (V37 修正)
 # ============================
 def render_clean_ecg_v37(df, layout_type, params, fs, sig_len):
-    """V37 修正版：传递 fs 和 sig_len"""
-    h, w = 1700, 2200
-    px_per_mm = params['px_per_mm']
+    """V43 修复：使用固定像素画布 + 计算有效物理标尺"""
     
+    # --- 1. (V43) 定义固定画布尺寸 (符合 "1k-2k" 范围) ---
+    h, w = 1700, 2200
+    
+    # --- 2. (V43) 定义像素边距 (占画布的百分比) ---
+    MT_px = int(h * 0.08) # ~136 px
+    MB_px = int(h * 0.05) # ~85 px
+    ML_px = int(w * 0.05) # ~110 px
+    MR_px = int(w * 0.05) # ~110 px
+    lead_in_area_px = int(w * 0.1) # ~220 px
+    
+    # --- 3. 获取物理参数 ---
+    # 注意：'px_per_mm' 已不再从 params 中采样，V42 的方案已废弃
+    paper_speed_mm_s = params['paper_speed_mm_s']
+    gain_mm_mv = params['gain_mm_mv']
+    
+    # --- 4. (V43 核心) 计算有效标尺 ---
+    
+    # 信号绘制区域的像素宽度 (px)
+    signal_start_x = ML_px + lead_in_area_px
+    signal_draw_w_px = w - signal_start_x - MR_px
+    
+    # 信号的物理时长
+    if layout_type in [LayoutType.LAYOUT_12X1, LayoutType.LAYOUT_3X4, LayoutType.LAYOUT_3X4_PLUS_II]:
+        PAPER_DURATION_S = 10.0
+    elif layout_type == LayoutType.LAYOUT_6X2:
+        PAPER_DURATION_S = 10.0 # 5s per column, 2 columns
+    else:
+        PAPER_DURATION_S = 10.0
+        
+    # (A) 像素/秒 标尺 (恒定)
+    px_per_s_on_paper = signal_draw_w_px / PAPER_DURATION_S
+    
+    # (B) 有效的 px/mm 标尺 (会根据纸速变化，实现尺度增强)
+    effective_px_per_mm = px_per_s_on_paper / paper_speed_mm_s
+    
+    # (C) 有效的 px/mV 标尺
+    effective_px_per_mv = effective_px_per_mm * gain_mm_mv
+
+    # --- 5. 初始化画布 (动态尺寸) ---
     paper_color = get_random_paper_color()
     plain_paper = generate_paper_texture(h, w, paper_color)
     
@@ -672,58 +646,45 @@ def render_clean_ecg_v37(df, layout_type, params, fs, sig_len):
     grid_minor_color = random_color_variations(random.choice(COLOR_GRID_MINOR_BASE_OPTIONS), 3)
     grid_major_color = random_color_variations(random.choice(COLOR_GRID_MAJOR_BASE_OPTIONS), 3)
     
-    # 网格绘制
-    for x in np.arange(0, w, px_per_mm):
+    # 🔥 V43 修复：网格必须使用 effective_px_per_mm 绘制
+    for x in np.arange(0, w, effective_px_per_mm):
         cv2.line(temp_base, (int(x), 0), (int(x), h), grid_minor_color, 2)
-    for y in np.arange(0, h, px_per_mm):
+    for y in np.arange(0, h, effective_px_per_mm):
         cv2.line(temp_base, (0, int(y)), (w, int(y)), grid_minor_color, 2)
-    for x in np.arange(0, w, px_per_mm * 5):
+    for x in np.arange(0, w, effective_px_per_mm * 5):
         cv2.line(temp_base, (int(x), 0), (int(x), h), grid_major_color, 3)
-    for y in np.arange(0, h, px_per_mm * 5):
+    for y in np.arange(0, h, effective_px_per_mm * 5):
         cv2.line(temp_base, (0, int(y)), (w, int(y)), grid_major_color, 3)
     
     base = generate_paper_texture(h, w, paper_color, grid_img=temp_base)
     
     sig_rgb = np.zeros((h, w, 3), dtype=np.uint8)
-    
-    # 🔥 修改：'alpha_waveform' -> 'wave_label_semantic_mask'
-    # 这个掩码现在将存储ID（1-12），而不是255
     wave_label_semantic_mask = np.zeros((h, w), dtype=np.uint8) 
-    
     alpha_other = np.zeros((h, w), dtype=np.uint8)
-    alpha_baseline = np.zeros((h, w), dtype=np.uint8)
+    baseline_heatmaps = np.zeros((12, h, w), dtype=np.uint8) # V40
     
     ink_color = get_random_ink_color()
     RANDOM_FONT = random.choice(FONT_LIST)
     
-    # 页眉/页脚
-    MT_GUESS = int(150 * (h/1700))
-    MB_GUESS = int(100 * (h/1700))
-    ML_GUESS = int(10*px_per_mm)
+    # --- 6. 绘制页眉/页脚 ---
     font_scale_header = random.uniform(0.8, 1.1)
     font_scale_footer = random.uniform(0.9, 1.2)
     
-    # 页眉位置保持不变（打印ID）
+    # 🔥 V43 修复：使用 effective_px_per_mm
     cv2.putText(sig_rgb, f"ID: {random.randint(10000, 99999)}_hr", 
-                (ML_GUESS, MT_GUESS - int(10*px_per_mm)), 
+                (ML_px, MT_px - int(10 * effective_px_per_mm)), 
                 RANDOM_FONT, font_scale_header, ink_color, 1, cv2.LINE_AA)
     cv2.putText(alpha_other, f"ID: {random.randint(10000, 99999)}_hr", 
-                (ML_GUESS, MT_GUESS - int(10*px_per_mm)), 
+                (ML_px, MT_px - int(10 * effective_px_per_mm)), 
                 RANDOM_FONT, font_scale_header, 255, 1, cv2.LINE_AA)
     
-    # V38 优化：纸速位置随机化
-    # 基准位置：底部中央偏左
-    base_x = w // 2 - int(50 * px_per_mm)
-    base_y = h - MB_GUESS + int(5 * px_per_mm)
+    base_x = w // 2 - int(50 * effective_px_per_mm)
+    base_y = h - MB_px + int(5 * effective_px_per_mm)
+    offset_x = random.randint(-int(30 * effective_px_per_mm), int(30 * effective_px_per_mm))
+    offset_y = random.randint(-int(8 * effective_px_per_mm), int(3 * effective_px_per_mm))
+    footer_x = max(ML_px, min(base_x + offset_x, w - int(100 * effective_px_per_mm)))
+    footer_y = max(h - MB_px - int(15 * effective_px_per_mm), min(base_y + offset_y, h - int(5 * effective_px_per_mm)))
     
-    # 添加随机偏移
-    offset_x = random.randint(-int(30 * px_per_mm), int(30 * px_per_mm))  # 左右浮动±30mm
-    offset_y = random.randint(-int(8 * px_per_mm), int(3 * px_per_mm))    # 上下浮动 -8mm~+3mm
-    
-    footer_x = max(ML_GUESS, min(base_x + offset_x, w - int(100 * px_per_mm)))  # 限制在页面内
-    footer_y = max(h - MB_GUESS - int(15 * px_per_mm), min(base_y + offset_y, h - int(5 * px_per_mm)))
-    
-    # 👇 这里是实际打印纸速的代码
     cv2.putText(sig_rgb, f"{params['paper_speed_mm_s']:.1f}mm/s", 
                 (footer_x, footer_y), 
                 RANDOM_FONT, font_scale_footer, ink_color, 2, cv2.LINE_AA)
@@ -731,40 +692,52 @@ def render_clean_ecg_v37(df, layout_type, params, fs, sig_len):
                 (footer_x, footer_y), 
                 RANDOM_FONT, font_scale_footer, 255, 2, cv2.LINE_AA)
     
-    # 布局渲染（传递 fs 和 sig_len）
-    # 🔥 修改：传递 'wave_label_semantic_mask'
+    # --- 7. (V43) 打包渲染参数 ---
+    render_params = {
+        'h': h,
+        'w': w,
+        'MT_px': MT_px,
+        'MB_px': MB_px,
+        'ML_px': ML_px,
+        'MR_px': MR_px,
+        'signal_start_x': signal_start_x,
+        'signal_draw_w_px': signal_draw_w_px,
+        'px_per_s_on_paper': px_per_s_on_paper,
+        'effective_px_per_mm': effective_px_per_mm,
+        'effective_px_per_mv': effective_px_per_mv
+    }
+    
+    # 🔥 V43 修复：将 'params' (物理) 和 'render_params' (像素+标尺) 分开传递
     if layout_type == LayoutType.LAYOUT_3X4_PLUS_II:
-        # 3x4+1 布局（带底部长导联）
-        render_layout_3x4_plus_II_v37(df, sig_rgb, wave_label_semantic_mask, alpha_other, alpha_baseline, h, w, params, ink_color, RANDOM_FONT, fs, sig_len)
+        render_layout_3x4_plus_II_v37(df, sig_rgb, wave_label_semantic_mask, alpha_other, baseline_heatmaps, params, ink_color, RANDOM_FONT, fs, sig_len, render_params)
     elif layout_type == LayoutType.LAYOUT_3X4:
-        # 🔥 修复：3x4 纯网格布局（不带长导联）需要专门的函数
-        render_layout_3x4_v37(df, sig_rgb, wave_label_semantic_mask, alpha_other, alpha_baseline, h, w, params, ink_color, RANDOM_FONT, fs, sig_len)
+        render_layout_3x4_v37(df, sig_rgb, wave_label_semantic_mask, alpha_other, baseline_heatmaps, params, ink_color, RANDOM_FONT, fs, sig_len, render_params)
     elif layout_type == LayoutType.LAYOUT_6X2:
-        # 6x2 布局使用新的 v38 函数
-        render_layout_6x2_v37(df, sig_rgb, wave_label_semantic_mask, alpha_other, alpha_baseline, h, w, params, ink_color, RANDOM_FONT, fs, sig_len)
+        render_layout_6x2_v37(df, sig_rgb, wave_label_semantic_mask, alpha_other, baseline_heatmaps, params, ink_color, RANDOM_FONT, fs, sig_len, render_params)
     elif layout_type == LayoutType.LAYOUT_12X1:
-        # 12x1 布局使用新的 v38 函数
-        render_layout_12x1_v37(df, sig_rgb, wave_label_semantic_mask, alpha_other, alpha_baseline, h, w, params, ink_color, RANDOM_FONT, fs, sig_len)
+        render_layout_12x1_v37(df, sig_rgb, wave_label_semantic_mask, alpha_other, baseline_heatmaps, params, ink_color, RANDOM_FONT, fs, sig_len, render_params)
     else:
-        # 默认使用 3x4+1 布局
-        render_layout_3x4_plus_II_v37(df, sig_rgb, wave_label_semantic_mask, alpha_other, alpha_baseline, h, w, params, ink_color, RANDOM_FONT, fs, sig_len)
+        render_layout_3x4_plus_II_v37(df, sig_rgb, wave_label_semantic_mask, alpha_other, baseline_heatmaps, params, ink_color, RANDOM_FONT, fs, sig_len, render_params)
     
-    # 🔥 修改：
-    # 'wave_label_semantic_mask' (值为 0-12) 是我们想要的标签
-    # 'combined_alpha' (值为 0 或 255) 用于渲染 'clean_img'
-    
-    # 1. 创建一个临时的二值波形掩码 (0 或 255)
+    # ... [ 图像混合部分不变 ] ...
     wave_mask_binary = (wave_label_semantic_mask > 0).astype(np.uint8) * 255
-    
-    # 2. 结合二值波形 和 其他元素（文本，脉冲）
     combined_alpha = np.maximum(wave_mask_binary, alpha_other)
-    
-    # 3. 使用 combined_alpha 渲染 clean_img
     alpha_mask = (combined_alpha.astype(np.float32) / 255.0)[..., None]
     clean_img = (base * (1.0 - alpha_mask) + sig_rgb * alpha_mask).astype(np.uint8)
     
-    # 🔥 修改：返回 'wave_label_semantic_mask' 作为波形标签
-    return clean_img, base, wave_label_semantic_mask, alpha_other, alpha_baseline, paper_color
+    # 🔥 V43 修复：返回 V40 的 12 通道基线
+    # (注意：'params' 包含采样值，'render_params' 包含计算出的有效标尺)
+    
+    # 我们需要将'有效标尺'保存到元数据中，替换 'params' 中的 'px_per_mm'
+    # 让我们创建一个新的 'metadata_params'
+    metadata_params = params.copy()
+    metadata_params['effective_px_per_mm'] = effective_px_per_mm
+    metadata_params['effective_px_per_mv'] = effective_px_per_mv
+    # 删除旧的 'px_per_mm'，因为它现在只是一个内部计算值
+    if 'px_per_mm' in metadata_params:
+        del metadata_params['px_per_mm'] 
+        
+    return clean_img, base, wave_label_semantic_mask, alpha_other, baseline_heatmaps, paper_color, metadata_params
 
 # ============================
 # 6. 退化引擎
@@ -792,10 +765,10 @@ def add_stains_v26(img):
     return img_stained
 
 def add_severe_damage(img, alpha_wave, alpha_other, alpha_baseline):
-    # 'alpha_wave' (即 'wave_label_semantic_mask') 在这里被正确处理
-    # 因为 cv2.line/circle 的颜色是 0，会清除所有导联ID
     h, w = img.shape[:2]
     num_damages = random.randint(2, 5)
+    num_channels = alpha_baseline.shape[0] # 应该为 12
+    
     for _ in range(num_damages):
         damage_type = random.choice(['tear', 'hole', 'crease'])
         if damage_type == 'tear':
@@ -803,16 +776,24 @@ def add_severe_damage(img, alpha_wave, alpha_other, alpha_baseline):
             x2, y2 = random.randint(0, w), random.randint(0, h)
             thickness = random.randint(5, 15)
             cv2.line(img, (x1, y1), (x2, y2), (240, 240, 240), thickness)
-            cv2.line(alpha_wave, (x1, y1), (x2, y2), 0, thickness) # 用 0 擦除
+            cv2.line(alpha_wave, (x1, y1), (x2, y2), 0, thickness)
             cv2.line(alpha_other, (x1, y1), (x2, y2), 0, thickness)
-            cv2.line(alpha_baseline, (x1, y1), (x2, y2), 0, thickness)
+            
+            # 🔥 V40 修改：循环所有基线通道
+            for i in range(num_channels):
+                cv2.line(alpha_baseline[i], (x1, y1), (x2, y2), 0, thickness)
+                
         elif damage_type == 'hole':
             center = (random.randint(0, w), random.randint(0, h))
             radius = random.randint(10, 30)
             cv2.circle(img, center, radius, (240, 240, 240), -1)
-            cv2.circle(alpha_wave, center, radius, 0, -1) # 用 0 擦除
+            cv2.circle(alpha_wave, center, radius, 0, -1)
             cv2.circle(alpha_other, center, radius, 0, -1)
-            cv2.circle(alpha_baseline, center, radius, 0, -1)
+            
+            # 🔥 V40 修改：循环所有基线通道
+            for i in range(num_channels):
+                cv2.circle(alpha_baseline[i], center, radius, 0, -1)
+                
     return img, alpha_wave, alpha_other, alpha_baseline
 
 def add_mold_spots(img):
@@ -880,13 +861,12 @@ def add_jpeg_compression(img, quality=None):
 
 def apply_degradation_pipeline_v32(img, grid, wave, other, baseline, degradation_type, paper_color):
     """
-    V32 版本：保持与原代码一致
-    'wave' (即 'wave_label_semantic_mask') 在这里被正确处理, 
-    因为它将使用 'cv2.INTER_NEAREST' 进行变换，这对于标签掩码是正确的。
+    V40 修改：处理 12 通道基线热图的几何变换
     """
     h, w = img.shape[:2]
+    num_baseline_channels = baseline.shape[0] # 应该为 12
     
-    # 类型特定退化
+    # ... [ 类型特定退化部分不变 ] ...
     if degradation_type == DegradationType.PRINTED_COLOR:
         img = add_printer_halftone(img)
         img = cv2.GaussianBlur(img, (3, 3), 0)
@@ -935,14 +915,17 @@ def apply_degradation_pipeline_v32(img, grid, wave, other, baseline, degradation
         
         img = cv2.warpPerspective(img, M_geo, (w, h), flags=cv2.INTER_LINEAR, borderValue=border_color_img)
         grid = cv2.warpPerspective(grid, M_geo, (w, h), flags=cv2.INTER_LINEAR, borderValue=border_color_grid)
-        
-        # 🔥 关键：对 'wave' (语义掩码) 使用 INTER_NEAREST 
         wave = cv2.warpPerspective(wave, M_geo, (w, h), flags=cv2.INTER_NEAREST, borderValue=border_color_mask)
-        
         other = cv2.warpPerspective(other, M_geo, (w, h), flags=cv2.INTER_NEAREST, borderValue=border_color_mask)
-        baseline = cv2.warpPerspective(baseline, M_geo, (w, h), flags=cv2.INTER_NEAREST, borderValue=border_color_mask)
-    
-    # 光学效果
+        
+        # 🔥 V40 修改：循环变换 12 个基线通道
+        warped_baselines = []
+        for i in range(num_baseline_channels):
+            warped_b = cv2.warpPerspective(baseline[i], M_geo, (w, h), flags=cv2.INTER_NEAREST, borderValue=border_color_mask)
+            warped_baselines.append(warped_b)
+        baseline = np.stack(warped_baselines, axis=0) # 重新堆叠为 (12, H, W)
+        
+    # ... [ 光学效果部分不变 ] ...
     X, Y = np.meshgrid(np.linspace(-1, 1, w), np.linspace(-1, 1, h))
     radius = np.sqrt(X**2 + Y**2)
     vignette = 1 - np.clip(radius * random.uniform(0.5, 0.8), 0, 1)
@@ -962,7 +945,7 @@ def apply_degradation_pipeline_v32(img, grid, wave, other, baseline, degradation
 BASE_DATA_DIR = "/Volumes/movie/work/physionet-ecg-image-digitization"
 OUTPUT_DIR = "/Volumes/movie/work/physionet-ecg-image-digitization-simulations-V37"
 CONFIG = {
-    "NUM_VARIATIONS_PER_CSV": 2,
+    "NUM_VARIATIONS_PER_CSV": 3,
     "LAYOUT_DISTRIBUTION": {
         LayoutType.LAYOUT_3X4_PLUS_II: 0.60, LayoutType.LAYOUT_3X4: 0.20,
         LayoutType.LAYOUT_6X2: 0.15, LayoutType.LAYOUT_12X1: 0.05,
@@ -988,14 +971,13 @@ def sample_degradation_type():
     return random.choices(types, weights=probs, k=1)[0]
 
 def process_one_id_v37(task_tuple, train_dir, train_meta_df, output_dir):
-    """V37 修正版：从 train.csv 读取 fs 和 sig_len"""
+    """V43 修复：使用固定画布 + 有效标尺"""
     ecg_id = None
     variation_index = None
     try:
         ecg_id, variation_index = task_tuple
         ecg_id_str = str(ecg_id)
         
-        # V37 修正：从 metadata 获取真实 fs 和 sig_len
         meta_row = train_meta_df[train_meta_df['id'] == int(ecg_id)]
         if len(meta_row) == 0:
             return (ecg_id_str, "metadata_not_found")
@@ -1005,7 +987,7 @@ def process_one_id_v37(task_tuple, train_dir, train_meta_df, output_dir):
         
         layout_type = sample_layout_type()
         degradation_type = sample_degradation_type()
-        params = sample_physical_params_v37(layout_type)
+        params = sample_physical_params_v37(layout_type) # V43: 不含 px_per_mm
         
         variation_id = f"{ecg_id_str}_v{variation_index:02d}_{layout_type}_{degradation_type}"
         csv_path = os.path.join(train_dir, ecg_id_str, f"{ecg_id_str}.csv")
@@ -1016,8 +998,8 @@ def process_one_id_v37(task_tuple, train_dir, train_meta_df, output_dir):
         grid_label_path = os.path.join(output_subdir, f"{variation_id}_label_grid.png")
         wave_label_path = os.path.join(output_subdir, f"{variation_id}_label_wave.png")
         other_label_path = os.path.join(output_subdir, f"{variation_id}_label_other.png")
-        baseline_label_path = os.path.join(output_subdir, f"{variation_id}_label_baseline.png")
         metadata_path = os.path.join(output_subdir, f"{variation_id}_metadata.json")
+        baseline_label_path = os.path.join(output_subdir, f"{variation_id}_label_baseline.npy") # V40
         
         if all(os.path.exists(p) for p in [dirty_path, grid_label_path, wave_label_path, other_label_path, baseline_label_path, metadata_path]):
             return (variation_id, "skipped")
@@ -1026,28 +1008,31 @@ def process_one_id_v37(task_tuple, train_dir, train_meta_df, output_dir):
             return (ecg_id_str, "csv_not_found")
         df = pd.read_csv(csv_path)
         
-        # V37 修正：传递 fs 和 sig_len
-        # 🔥 修改：'alpha_wave_paper' 现在是 'wave_label_semantic_mask' (值为 0-12)
-        clean_img_paper, grid_img_paper, alpha_wave_paper, alpha_other_paper, alpha_baseline_paper, paper_color = \
+        # 🔥 V43 修复：render_clean_ecg_v37 现在返回 metadata_params
+        clean_img_paper, grid_img_paper, alpha_wave_paper, alpha_other_paper, baseline_heatmaps_paper, paper_color, metadata_params = \
             render_clean_ecg_v37(df, layout_type=layout_type, params=params, fs=fs, sig_len=sig_len)
         
+        # 'clean_img_paper' 尺寸固定为 h=1700, w=2200
         h_paper, w_paper = clean_img_paper.shape[:2]
+        
+        # 🔥 V43 修复：扫描仪底板边距现在是固定的像素
         h_bed = h_paper + random.randint(100, 300)
         w_bed = w_paper + random.randint(100, 400)
         
         bed_img = generate_scanner_background(h_bed, w_bed)
         bed_label_grid = np.zeros((h_bed, w_bed, 3), dtype=np.uint8)
-        bed_label_wave = np.zeros((h_bed, w_bed), dtype=np.uint8) # 仍然是 uint8
+        bed_label_wave = np.zeros((h_bed, w_bed), dtype=np.uint8)
         bed_label_other = np.zeros((h_bed, w_bed), dtype=np.uint8)
-        bed_label_baseline = np.zeros((h_bed, w_bed), dtype=np.uint8)
+        bed_label_baseline = np.zeros((12, h_bed, w_bed), dtype=np.uint8) # V40
+        
         x_offset = random.randint(20, w_bed - w_paper - 20)
         y_offset = random.randint(20, h_bed - h_paper - 20)
         
         bed_img[y_offset:y_offset+h_paper, x_offset:x_offset+w_paper] = clean_img_paper
         bed_label_grid[y_offset:y_offset+h_paper, x_offset:x_offset+w_paper] = grid_img_paper
-        bed_label_wave[y_offset:y_offset+h_paper, x_offset:x_offset+w_paper] = alpha_wave_paper # 粘贴语义掩码
+        bed_label_wave[y_offset:y_offset+h_paper, x_offset:x_offset+w_paper] = alpha_wave_paper
         bed_label_other[y_offset:y_offset+h_paper, x_offset:x_offset+w_paper] = alpha_other_paper
-        bed_label_baseline[y_offset:y_offset+h_paper, x_offset:x_offset+w_paper] = alpha_baseline_paper
+        bed_label_baseline[:, y_offset:y_offset+h_paper, x_offset:x_offset+w_paper] = baseline_heatmaps_paper # V40
         
         dirty_img, M_geo, grid_label_warped, wave_label_warped, other_label_warped, baseline_label_warped = \
             apply_degradation_pipeline_v32(
@@ -1057,24 +1042,27 @@ def process_one_id_v37(task_tuple, train_dir, train_meta_df, output_dir):
         
         cv2.imwrite(dirty_path, dirty_img)
         cv2.imwrite(grid_label_path, grid_label_warped)
-        cv2.imwrite(wave_label_path, wave_label_warped) # 保存 0-12 值的语义掩码
+        cv2.imwrite(wave_label_path, wave_label_warped)
         cv2.imwrite(other_label_path, other_label_warped)
-        cv2.imwrite(baseline_label_path, baseline_label_warped)
+        np.save(baseline_label_path, baseline_label_warped.astype(np.uint8)) # V40
         
-        # V37 修正：保存 fs 和 sig_len 到 metadata
         metadata = {
             "ecg_id": ecg_id_str,
             "fs": fs,
             "sig_len": sig_len,
             "layout_type": layout_type,
             "degradation_type": degradation_type,
-            "physical_params": params,
+            # 🔥 V43 修复：保存包含 'effective' 标尺的 metadata_params
+            "physical_params": metadata_params, 
             "image_size_bed": {"height": h_bed, "width": w_bed},
             "paper_paste_offset": {"x": x_offset, "y": y_offset},
             "geometric_transform": M_geo.tolist() if not np.allclose(M_geo, np.eye(3)) else None,
             "paper_color_bgr": paper_color,
-            # 🔥 新增：保存导联ID映射
-            "lead_to_id_map": LEAD_TO_ID_MAP
+            "lead_to_id_map": LEAD_TO_ID_MAP,
+            "label_format": { # V40
+                "wave": "semantic_mask_png_0_12",
+                "baseline": "multichannel_npy_12xHxW"
+            }
         }
         
         with open(metadata_path, 'w') as f:
@@ -1085,7 +1073,7 @@ def process_one_id_v37(task_tuple, train_dir, train_meta_df, output_dir):
     except Exception as e:
         import traceback
         print(f"Error processing {ecg_id} v{variation_index}: {e}")
-        traceback.print_exc() # 打印完整堆栈
+        traceback.print_exc() 
         
         if ecg_id is not None and variation_index is not None:
             variation_id = f"{ecg_id}_v{variation_index:02d}"
