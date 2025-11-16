@@ -164,3 +164,5 @@ python simulator.py --workers 8
       * **真实性增强:** 6x2 布局增益调整（降低 20mm/mV 概率）。
       * **多样性增强:** 引入 "Floating Tick Marks"（悬浮分隔符）。
       * **元数据:** `metadata.json` 现包含 `lead_to_id_map` 以方便下游 dataloader 解析。
+
+
