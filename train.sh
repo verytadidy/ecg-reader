@@ -233,6 +233,7 @@ debug_train() {
     echo "  Warmup: 2"
     echo "  Batch Size: 4"
     echo "  Workers: 0"
+    echo "  Workers: 0"
     echo ""
     
     DEBUG_OUTPUT="$OUTPUT_DIR/debug_v48"
@@ -359,6 +360,7 @@ resume_train() {
     
     echo ""
     read -p "是否恢复训练？[y/N] " yn
+    read -p "是否恢复训练？[y/N] " yn
     case $yn in
         [Yy]*)
             python ecg_train_v48_fixed.py \
@@ -372,7 +374,9 @@ resume_train() {
                 --lr $LR \
                 --num_workers $NUM_WORKERS \
                 --input_size $INPUT_SIZE \
-                --target_fs $TARGET_FS
+                --target_fs $TARGET_FS \
+                --weight_seg $WEIGHT_SEG \
+                --weight_signal $WEIGHT_SIGNAL
             
             if [ $? -eq 0 ]; then
                 print_info "训练完成！"
