@@ -212,18 +212,64 @@ class ECGV47ProductionDataset(Dataset):
             }
         }
 
-def create_dataloaders(sim_root, csv_root, batch_size=8, num_workers=4, **kwargs):
-    """工厂函数"""
-    dataset = ECGV47ProductionDataset(sim_root, csv_root, **kwargs)
-    loader = torch.utils.data.DataLoader(
-        dataset, 
-        batch_size=batch_size,
+def create_dataloaders(sim_root, csv_root, batch_size=8, num_workers=4, train_split=0.9, **kwargs):
+    """
+    工厂函数: 创建训练和验证 DataLoader
+    
+    自动执行 train/val 划分，并确保验证集不进行数据增强。
+    """
+    # 1. 获取数据集大小 (通过一次轻量级实例化)
+    # 我们先用 augment=True 初始化训练集
+    # 注意：pop 出 augment 参数防止冲突，强制由本函数控制
+    if 'augment' in kwargs:
+        kwargs.pop('augment')
+        
+    train_ds_full = ECGV47ProductionDataset(
+        sim_root, csv_root, split='train', augment=True, **kwargs
+    )
+    
+    # 2. 生成固定的划分索引
+    dataset_size = len(train_ds_full)
+    indices = list(range(dataset_size))
+    split_idx = int(np.floor(train_split * dataset_size))
+    
+    # 设置随机种子以保证可复现性
+    np.random.seed(42)
+    np.random.shuffle(indices)
+    train_indices, val_indices = indices[:split_idx], indices[split_idx:]
+    
+    print(f"Dataset Split: Train={len(train_indices)}, Val={len(val_indices)}")
+    
+    # 3. 实例化验证集 (强制关闭增强 augment=False)
+    # 虽然多扫描了一次文件，但保证了验证数据的纯净性
+    val_ds_full = ECGV47ProductionDataset(
+        sim_root, csv_root, split='val', augment=False, **kwargs
+    )
+    
+    # 4. 创建 Subset
+    train_subset = torch.utils.data.Subset(train_ds_full, train_indices)
+    val_subset = torch.utils.data.Subset(val_ds_full, val_indices)
+    
+    # 5. 创建 DataLoader
+    train_loader = torch.utils.data.DataLoader(
+        train_subset, 
+        batch_size=batch_size, 
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True
     )
-    return loader
+    
+    val_loader = torch.utils.data.DataLoader(
+        val_subset, 
+        batch_size=batch_size, 
+        shuffle=False, # 验证集不打乱
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False
+    )
+    
+    return train_loader, val_loader
 
 # =============================================================================
 # 模块测试
@@ -235,45 +281,65 @@ if __name__ == "__main__":
     
     # 模拟命令行参数
     parser = argparse.ArgumentParser(description='Test ECG Dataset')
-    parser.add_argument('--sim_root', type=str, default='./data/sim_output', help='Path to simulation output')
-    parser.add_argument('--csv_root', type=str, default='./data/train', help='Path to raw CSVs')
+    parser.add_argument('--sim_root', type=str, required=True, help='Path to simulation output')
+    parser.add_argument('--csv_root', type=str, required=True, help='Path to raw CSVs')
     args = parser.parse_args()
 
-    # 检查路径是否存在，不存在则创建 dummy 数据进行测试
+    # 检查路径是否存在
     sim_path = Path(args.sim_root)
     if not sim_path.exists():
-        print(f"Warning: {sim_path} does not exist. Skipping real data test.")
+        print(f"Warning: {sim_path} does not exist.")
     else:
-        print("Testing with real data...")
-        dataset = ECGV47ProductionDataset(
-            sim_root_dir=args.sim_root, 
-            csv_root_dir=args.csv_root,
-            target_size=(512, 2048),
-            augment=True
-        )
+        print("Testing create_dataloaders...")
         
-        if len(dataset) > 0:
-            # 加载一个样本
-            sample = dataset[0]
-            print("\nSample Shapes:")
-            print(f"Image: {sample['image'].shape}")
-            print(f"Baseline Mask: {sample['baseline_mask'].shape}")
-            print(f"Text Mask: {sample['text_mask'].shape}")
-            print(f"GT Signals: {sample['gt_signals'].shape}")
-            print(f"Metadata: {sample['metadata']}")
+        # 1. 测试加载器工厂函数 (验证修复后的 unpack 逻辑)
+        try:
+            train_loader, val_loader = create_dataloaders(
+                sim_root=args.sim_root, 
+                csv_root=args.csv_root,
+                batch_size=4,
+                num_workers=2,
+                max_samples=50, # 限制样本数快速测试
+                train_split=0.9
+            )
             
-            # 简单可视化验证
-            # img_vis = sample['image'].permute(1, 2, 0).numpy()
-            # img_vis = (img_vis * np.array([0.229, 0.224, 0.225])) + np.array([0.485, 0.456, 0.406])
-            # img_vis = np.clip(img_vis, 0, 1)
-            # plt.imshow(img_vis)
-            # plt.title(f"ID: {sample['metadata']['ecg_id']}")
-            # plt.show()
+            print(f"\n✅ Dataloader creation successful!")
+            print(f"Train Loader batches: {len(train_loader)}")
+            print(f"Val Loader batches:   {len(val_loader)}")
             
-            # 验证信号非空
-            if torch.sum(torch.abs(sample['gt_signals'])) > 0:
-                print("✓ GT Signals contain data.")
-            else:
-                print("✗ GT Signals are all zeros (check json loading).")
-        else:
-            print("No samples found in directory.")
+            # 2. 测试一个 Batch 的数据结构
+            print("\nInspecting first Train Batch:")
+            start = time.time()
+            for batch in train_loader:
+                print(f"  Image Shape:       {batch['image'].shape}")       # (B, 3, H, W)
+                print(f"  Baseline Mask:     {batch['baseline_mask'].shape}") # (B, 12, H, W)
+                print(f"  Text Mask:         {batch['text_mask'].shape}")     # (B, 13, H, W)
+                print(f"  GT Signals:        {batch['gt_signals'].shape}")    # (B, 12, W/4)
+                print(f"  Valid Mask:        {batch['valid_mask'].shape}")    # (B, 12, W/4)
+                
+                # 检查 Metadata
+                gains = batch['metadata']['gain']
+                speeds = batch['metadata']['speed']
+                print(f"  Metadata Gain ex:  {gains[0]:.1f}")
+                print(f"  Metadata Speed ex: {speeds[0]:.1f}")
+                
+                # 验证数据有效性
+                if torch.isnan(batch['image']).any():
+                    print("  ❌ Warning: Image contains NaNs!")
+                else:
+                    print("  ✅ Image data is valid (no NaNs).")
+                    
+                if batch['gt_signals'].sum() == 0:
+                     print("  ⚠️ Warning: GT signals are all zeros (check json loading).")
+                else:
+                     print("  ✅ GT signals contain data.")
+
+                break # 只看一个batch
+            
+            print(f"\nTime to load one batch: {time.time() - start:.4f}s")
+            
+        except ValueError as e:
+            print(f"\n❌ Error: {e}")
+            print("Ensure create_dataloaders returns exactly 2 values: (train_loader, val_loader)")
+        except Exception as e:
+            print(f"\n❌ Unexpected Error: {e}")

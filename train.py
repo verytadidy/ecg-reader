@@ -134,6 +134,13 @@ class ECGTrainer:
         print(f"LR          : {self.args.lr}")
         print(f"AMP Enabled : {self.use_amp}")
         print(f"Num Workers : {self.args.num_workers}")
+        # === 模型参数统计 ===
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        print(f"Total Params: {total_params:,}")
+        print(f"Trainable   : {trainable_params:,}")
+        print(f"Model Size  : {total_params * 4 / 1024 / 1024:.2f} MB (FP32)")
+        # ===================
         print(f"{'='*60}\n")
 
     def calculate_loss(self, outputs, targets):
@@ -193,6 +200,7 @@ class ECGTrainer:
                 'baseline_fine': batch['baseline_mask'].to(self.device), 
                 'paper_speed_mask': torch.zeros_like(batch['baseline_mask']).to(self.device), # 暂无 GT
                 'gain_mask': torch.zeros_like(batch['baseline_mask']).to(self.device), # 暂无 GT
+                'valid_mask': batch['valid_mask'].to(self.device),
                 'metadata': batch['metadata']
             }
             
