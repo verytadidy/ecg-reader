@@ -1,14 +1,13 @@
 """
-ECG 仿真器 V46 - 终极融合版
+ECG 仿真器 V47 - 修复版
 
-融合特性:
-1. ✅ V38的优质渲染 (分隔符、纹理、背景)
-2. ✅ V46的完整标注 (13层文字、定标脉冲、真值信号)
-3. ✅ 100%兼容渐进式模型架构
-4. ✅ 位置和字体随机性
+修复日志:
+1. ✅ 修复布局渲染逻辑，真正支持 3x4, 6x2, 12x1 等多种布局 (使用 render_layout_universal)
+2. ✅ 修复波形线条过细导致不可见的问题 (最小宽度提升至 2px)
+3. ✅ 优化分隔符绘制逻辑
 
 运行:
-    python ecg_simulator_v46_ultimate.py --workers 8 --limit 100
+    python ecg_simulator.py --workers 8 --limit 100
 """
 
 import numpy as np
@@ -220,7 +219,7 @@ def sample_physical_params(layout_type):
     }
 
 # ============================
-# 3. 渲染子模块 (融合版)
+# 3. 渲染子模块 (修复版：通用布局渲染)
 # ============================
 def render_calibration_pulse(img, alpha_auxiliary, alpha_text, x_start, y_baseline,
                             px_per_mm, px_per_mv, paper_speed_mm_s, ink_color, thick):
@@ -251,8 +250,6 @@ def render_calibration_pulse(img, alpha_auxiliary, alpha_text, x_start, y_baseli
     # 绘制在RGB图和辅助掩码上
     cv2.polylines(img, [pts], False, ink_color, thick, cv2.LINE_AA)
     cv2.polylines(alpha_auxiliary, [pts], False, 255, thick, cv2.LINE_AA)
-    
-    # 移除"1mV"文字标注
     
     bbox = [x_start, y_baseline - pulse_height_px, x_end, y_baseline]
     
@@ -289,10 +286,6 @@ def draw_lead_separator(img, alpha_auxiliary, x, y_baseline, px_per_mm, ink_colo
 def render_lead_text(img, text_mask, text, x, y, font, scale, color, thick, lead_id):
     """
     渲染导联文字 (带位置随机性)
-    
-    Args:
-        text_mask: (13, H, W) 多层文字掩码
-        lead_id: 1-12 (对应text_mask的通道1-12)
     """
     # 添加位置抖动
     x_jitter = x + random.randint(-2, 2)
@@ -307,17 +300,19 @@ def render_lead_text(img, text_mask, text, x, y, font, scale, color, thick, lead
     (w, h), _ = cv2.getTextSize(text, font, scale_jitter, thick)
     return [x_jitter, y_jitter - h, x_jitter + w, y_jitter]
 
-def render_layout_3x4_plus_II_ultimate(df, sig_rgb, wave_label, text_masks, alpha_auxiliary,
-                                       baseline_heatmaps, params, ink_color, font, fs,
-                                       render_params, lead_rois_dict, calibration_pulse_bboxes):
+def render_layout_universal(df, sig_rgb, wave_label, text_masks, alpha_auxiliary,
+                            baseline_heatmaps, params, ink_color, font, fs,
+                            render_params, lead_rois_dict, calibration_pulse_bboxes,
+                            layout_type):
     """
-    终极融合版: 3x4+II 布局渲染
+    通用布局渲染函数：支持 3x4+1, 3x4, 6x2, 12x1
+    """
+    # 获取布局配置
+    config = LAYOUT_CONFIGS[layout_type]
+    rows = config['rows']
+    cols = config['cols']
+    long_lead_name = config['long_lead']
     
-    特性:
-    - V38的渲染质量 (分隔符、脉冲样式)
-    - V46的完整标注 (13层文字、辅助掩码、真值信号)
-    - 位置和字体随机性
-    """
     h, w = render_params['h'], render_params['w']
     MT_px = render_params['MT_px']
     MB_px = render_params['MB_px']
@@ -326,62 +321,83 @@ def render_layout_3x4_plus_II_ultimate(df, sig_rgb, wave_label, text_masks, alph
     eff_px_mm = render_params['effective_px_per_mm']
     eff_px_mv = render_params['effective_px_per_mv']
     
-    main_h = (h - MT_px - MB_px) * 0.75
-    rhythm_h = (h - MT_px - MB_px) * 0.25
-    row_h = main_h / 3
-    TIME_PER_COL = 2.5
-    
-    thick_signal = random.randint(1, 2)
-    thick_pulse = thick_signal + 1
+    # --- 修复：线条过细问题 ---
+    # 最小宽度从 1px 提升到 2px，确保可见性
+    thick_signal = random.randint(1, 3) 
+    thick_pulse = thick_signal + random.randint(0, 2)
     font_scale = random.uniform(0.9, 1.2)
     
-    # 定标脉冲起始位置 (带随机性)
+    # 计算区域分配
+    available_h = h - MT_px - MB_px
+    
+    if long_lead_name:
+        # 如果有长导联 (如 3x4+1)，给长导联预留底部 25% 空间
+        main_h = available_h * 0.75
+        rhythm_h = available_h * 0.25
+    else:
+        # 如果没有长导联 (如 3x4, 6x2, 12x1)，主网格占满空间
+        main_h = available_h
+        rhythm_h = 0
+        
+    row_h = main_h / rows
+    
+    # 计算每列的时间长度 (总时长10秒 / 列数)
+    # 3x4 -> 2.5s, 6x2 -> 5.0s, 12x1 -> 10.0s
+    TIME_PER_COL = 10.0 / cols
+    
+    # --- 1. 渲染定标脉冲 ---
+    # 每个网格行渲染一个脉冲
     x_pulse_start = int(signal_start_x - random.uniform(10.0, 12.0) * eff_px_mm)
     x_pulse_end_max = 0
     
-    # 渲染主网格的定标脉冲
-    for r in range(3):
+    for r in range(rows):
         base_y = int(MT_px + (r + 0.5) * row_h)
         x_end, pulse_bbox = render_calibration_pulse(
-            sig_rgb, alpha_auxiliary[0], alpha_auxiliary[0],  # 两个参数都用alpha_auxiliary
+            sig_rgb, alpha_auxiliary[0], alpha_auxiliary[0],
             x_pulse_start, base_y,
             eff_px_mm, eff_px_mv, params['paper_speed_mm_s'],
             ink_color, thick_pulse
         )
         x_pulse_end_max = max(x_pulse_end_max, x_end)
         calibration_pulse_bboxes.append(pulse_bbox)
-    
-    # 渲染长导联的定标脉冲
-    base_y_long = int(MT_px + main_h + rhythm_h / 2)
-    x_end_long, pulse_bbox_long = render_calibration_pulse(
-        sig_rgb, alpha_auxiliary[0], alpha_auxiliary[0],  # 两个参数都用alpha_auxiliary
-        x_pulse_start, base_y_long,
-        eff_px_mm, eff_px_mv, params['paper_speed_mm_s'],
-        ink_color, thick_pulse
-    )
-    calibration_pulse_bboxes.append(pulse_bbox_long)
+        
+    # 如果有长导联，也给它加个脉冲
+    if long_lead_name:
+        base_y_long = int(MT_px + main_h + rhythm_h / 2)
+        x_end_long, pulse_bbox_long = render_calibration_pulse(
+            sig_rgb, alpha_auxiliary[0], alpha_auxiliary[0],
+            x_pulse_start, base_y_long,
+            eff_px_mm, eff_px_mv, params['paper_speed_mm_s'],
+            ink_color, thick_pulse
+        )
+        calibration_pulse_bboxes.append(pulse_bbox_long)
     
     total_samples = min(len(df), int(fs * 10.0))
     
-    # 渲染12个短导联
-    for lead, (r, c) in LAYOUT_CONFIGS[LayoutType.LAYOUT_3X4_PLUS_II]['leads'].items():
+    # --- 2. 渲染网格导联 (Grid Leads) ---
+    for lead, (r, c) in config['leads'].items():
         if lead not in df.columns:
             continue
-        
+            
         base_y = int(MT_px + (r + 0.5) * row_h)
+        
+        # 计算该导联的时间窗口
         t_start = c * TIME_PER_COL
         t_end = t_start + TIME_PER_COL
         
         idx_start = int(t_start * fs)
         idx_end = min(int(t_end * fs), total_samples)
+        
+        # 获取信号
         sig = df[lead].iloc[idx_start:idx_end].dropna().values
         
+        # 计算X轴范围
         x_start_line = int(signal_start_x + t_start * px_per_s)
         x_end_line = int(signal_start_x + t_end * px_per_s)
         
         lead_id = LEAD_TO_ID_MAP[lead]
         
-        # 绘制基线
+        # 绘制基线 (用于Label)
         cv2.line(baseline_heatmaps[lead_id - 1], (x_start_line, base_y),
                 (x_end_line, base_y), 255, thick_signal, cv2.LINE_AA)
         
@@ -395,15 +411,21 @@ def render_layout_3x4_plus_II_ultimate(df, sig_rgb, wave_label, text_masks, alph
             
             cv2.polylines(sig_rgb, [pts], False, ink_color, thick_signal, cv2.LINE_AA)
             cv2.polylines(wave_label, [pts], False, lead_id, thick_signal, cv2.LINE_AA)
+            
+        # 绘制导联文字
+        txt_y = int(base_y - row_h * 0.35) # 稍微上移，避免遮挡波形
         
-        # 绘制导联文字 (带位置随机性)
-        txt_y = int(base_y - row_h * 0.3)
+        # 第一列文字靠近定标脉冲，后续列文字根据时间偏移
         if c == 0:
             txt_x_gap_mm = random.uniform(2.0, 5.0)
             txt_x = int(x_pulse_end_max + txt_x_gap_mm * eff_px_mm)
         else:
             txt_x = int(signal_start_x + (c * TIME_PER_COL) * px_per_s + 
                        random.uniform(2, 4) * eff_px_mm)
+            
+            # 绘制分隔符 (在非第一列的起始处)
+            sep_x = int(signal_start_x + (c * TIME_PER_COL) * px_per_s)
+            draw_lead_separator(sig_rgb, alpha_auxiliary[0], sep_x, base_y, eff_px_mm, ink_color)
         
         txt_x = max(0, min(txt_x, w - 1))
         txt_y = max(10, min(txt_y, h - 1))
@@ -420,28 +442,18 @@ def render_layout_3x4_plus_II_ultimate(df, sig_rgb, wave_label, text_masks, alph
             'baseline_y': base_y,
             'time_range': [t_start, t_end]
         }
-    
-    # 绘制分隔符
-    for c in range(1, 4):
-        sep_x = int(signal_start_x + (c * TIME_PER_COL) * px_per_s)
-        for r in range(3):
-            base_y = int(MT_px + (r + 0.5) * row_h)
-            draw_lead_separator(sig_rgb, alpha_auxiliary[0], sep_x, base_y, eff_px_mm, ink_color)
-    
-    # 渲染长导联
-    long_lead = 'II'
-    if long_lead in df.columns:
+
+    # --- 3. 渲染长导联 (如果存在) ---
+    if long_lead_name and long_lead_name in df.columns:
         base_y = int(MT_px + main_h + rhythm_h / 2)
         
-        # 文字
-        txt_x = int(x_end_long + random.uniform(2, 4) * eff_px_mm)
+        # 文字 (对齐第一列的定标脉冲)
+        txt_x = int(x_pulse_end_max + random.uniform(2, 4) * eff_px_mm)
         txt_y = int(base_y - rhythm_h * 0.3)
-        txt_x = max(0, min(txt_x, w - 1))
-        txt_y = max(10, min(txt_y, h - 1))
         
-        lead_id = LEAD_TO_ID_MAP[long_lead]
+        lead_id = LEAD_TO_ID_MAP[long_lead_name]
         txt_bbox = render_lead_text(
-            sig_rgb, text_masks, long_lead,
+            sig_rgb, text_masks, long_lead_name,
             txt_x, txt_y, font, font_scale, ink_color, 2, lead_id
         )
         
@@ -451,10 +463,10 @@ def render_layout_3x4_plus_II_ultimate(df, sig_rgb, wave_label, text_masks, alph
                 (signal_start_x + render_params['signal_draw_w_px'], base_y),
                 255, thick_signal, cv2.LINE_AA)
         
-        # 波形
+        # 波形 (全长 10s)
         idx_start = 0
         idx_end = min(int(10.0 * fs), total_samples)
-        sig_full = df[long_lead].iloc[idx_start:idx_end].dropna().values
+        sig_full = df[long_lead_name].iloc[idx_start:idx_end].dropna().values
         
         if len(sig_full) > 0:
             t_axis = np.linspace(0, 10.0, len(sig_full))
@@ -465,26 +477,19 @@ def render_layout_3x4_plus_II_ultimate(df, sig_rgb, wave_label, text_masks, alph
             
             cv2.polylines(sig_rgb, [pts], False, ink_color, thick_signal, cv2.LINE_AA)
             cv2.polylines(wave_label, [pts], False, lead_id, thick_signal, cv2.LINE_AA)
-        
+            
         # 保存RoI
-        lead_rois_dict[long_lead] = {
-            'bbox': [signal_start_x, int(base_y - 150),
-                    signal_start_x + render_params['signal_draw_w_px'], int(base_y + 150)],
-            'text_bbox': txt_bbox,
-            'baseline_y': base_y,
-            'time_range': [0.0, 10.0]
+        lead_rois_dict[long_lead_name + "_long"] = {
+             'bbox': [signal_start_x, int(base_y - rhythm_h/2),
+                     signal_start_x + render_params['signal_draw_w_px'], int(base_y + rhythm_h/2)],
+             'text_bbox': txt_bbox,
+             'baseline_y': base_y,
+             'time_range': [0.0, 10.0]
         }
-    
-    # 不再在这里生成背景通道，而是在主渲染函数中统一处理
 
 def render_clean_ecg_ultimate(df, layout_type, params, fs, sig_len):
     """
     终极融合版主渲染函数
-    
-    特性:
-    - V38的高质量纸张和网格纹理
-    - V46的完整标注体系
-    - 所有标注符合渐进式模型需求
     """
     h, w = 1700, 2200
     MT_px = int(h * 0.08)
@@ -559,25 +564,13 @@ def render_clean_ecg_ultimate(df, layout_type, params, fs, sig_len):
     lead_rois = {}
     calibration_pulse_bboxes = []
     
-    # 4. 根据布局类型渲染
-    if layout_type == LayoutType.LAYOUT_3X4_PLUS_II:
-        render_layout_3x4_plus_II_ultimate(
-            df, sig_rgb, wave_label, text_masks, alpha_auxiliary,
-            baseline_heatmaps, params, ink_color, font, fs,
-            render_params, lead_rois, calibration_pulse_bboxes
-        )
-    elif layout_type == LayoutType.LAYOUT_3X4:
-        render_layout_3x4_plus_II_ultimate(
-            df, sig_rgb, wave_label, text_masks, alpha_auxiliary,
-            baseline_heatmaps, params, ink_color, font, fs,
-            render_params, lead_rois, calibration_pulse_bboxes
-        )
-    else:
-        render_layout_3x4_plus_II_ultimate(
-            df, sig_rgb, wave_label, text_masks, alpha_auxiliary,
-            baseline_heatmaps, params, ink_color, font, fs,
-            render_params, lead_rois, calibration_pulse_bboxes
-        )
+    # 4. 根据布局类型渲染 (修复：调用通用布局函数)
+    render_layout_universal(
+        df, sig_rgb, wave_label, text_masks, alpha_auxiliary,
+        baseline_heatmaps, params, ink_color, font, fs,
+        render_params, lead_rois, calibration_pulse_bboxes,
+        layout_type
+    )
     
     # 5. 添加页脚 (纸速/增益，带随机位置)
     font_scale_footer = random.uniform(0.9, 1.2)
@@ -615,7 +608,7 @@ def render_clean_ecg_ultimate(df, layout_type, params, fs, sig_len):
         'calibration_pulses': calibration_pulse_bboxes
     }
     
-    # 6. 图像融合 [修复版 - 包含所有内容]
+    # 6. 图像融合
     # 生成背景通道 (通道0) - 在融合前
     foreground_union = np.clip(text_masks[1:].sum(axis=0), 0, 255).astype(np.uint8)
     text_masks[0] = 255 - foreground_union
@@ -624,7 +617,7 @@ def render_clean_ecg_ultimate(df, layout_type, params, fs, sig_len):
     wave_mask_binary = (wave_label > 0).astype(np.uint8) * 255
     
     # 文字掩码: 合并所有导联文字 (通道1-12)
-    text_mask_combined = foreground_union  # 已经计算过了
+    text_mask_combined = foreground_union
     
     # 合并所有alpha通道
     combined_alpha = np.maximum(wave_mask_binary, alpha_auxiliary[0])
@@ -781,11 +774,6 @@ def add_jpeg_compression(img, quality=None):
 def apply_degradation_pipeline_ultimate(img, masks_dict, degradation_type, paper_color):
     """
     终极融合版退化管道
-    
-    特性:
-    - V38的所有退化效果
-    - V46的几何变换
-    - 完整的掩码处理
     """
     h, w = img.shape[:2]
     
@@ -1085,13 +1073,6 @@ def process_one_id_ultimate(task_tuple, train_dir, train_meta_df, output_dir):
         save_dir = os.path.join(output_dir, var_id)
         os.makedirs(save_dir, exist_ok=True)
         
-        cv2.imwrite(os.path.join(save_dir, f"{var_id}_dirty.png"), dirty_img)
-        
-        # 保存
-        var_id = f"{ecg_id_str}_v{var_idx:02d}_{layout_type}_{degradation_type}"
-        save_dir = os.path.join(output_dir, var_id)
-        os.makedirs(save_dir, exist_ok=True)
-        
         # 保存脏图
         cv2.imwrite(os.path.join(save_dir, f"{var_id}_dirty.png"), dirty_img)
         
@@ -1208,7 +1189,7 @@ def validate_sample_output(sample_dir):
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='ECG Simulator V46 - Ultimate Fusion Version')
+    parser = argparse.ArgumentParser(description='ECG Simulator V47 - Fixed Version')
     parser.add_argument('--workers', type=int, default=4,
                        help='Number of parallel workers')
     parser.add_argument('--limit', type=int, default=None,
@@ -1223,7 +1204,7 @@ if __name__ == "__main__":
     
     # 配置路径
     BASE_DATA_DIR = "/Volumes/movie/work/physionet-ecg-image-digitization"
-    OUTPUT_DIR = "/Volumes/movie/work/physionet-ecg-image-digitization-simulations-V46-Ultimate"
+    OUTPUT_DIR = "/Volumes/movie/work/physionet-ecg-image-digitization-simulations-V47"
     TRAIN_CSV = os.path.join(BASE_DATA_DIR, "train.csv")
     TRAIN_DIR = os.path.join(BASE_DATA_DIR, "train")
     
@@ -1254,7 +1235,7 @@ if __name__ == "__main__":
             tasks.append((ecg_id, var_idx))
     
     print(f"=" * 70)
-    print(f"ECG Simulator V46 - Ultimate Fusion Version")
+    print(f"ECG Simulator V47 - Fixed Version")
     print(f"=" * 70)
     print(f"Total ECG IDs: {len(ids)}")
     print(f"Variations per ID: {args.variations}")
@@ -1263,11 +1244,9 @@ if __name__ == "__main__":
     print(f"Workers: {args.workers if not args.debug else 1}")
     print(f"=" * 70)
     print("\nKey Features:")
-    print("  ✅ V38 High-quality rendering (separators, textures)")
-    print("  ✅ V46 Complete annotations (13-layer text, pulses)")
-    print("  ✅ 100% compatible with progressive model architecture")
-    print("  ✅ Position and font randomness")
-    print("  ✅ Ground truth signals saved")
+    print("  ✅ V47 Fixes: Real layout support & thicker lines")
+    print("  ✅ V38 High-quality rendering")
+    print("  ✅ V46 Complete annotations")
     print(f"=" * 70)
     
     # 处理任务

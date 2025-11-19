@@ -1,0 +1,25 @@
+{
+  "statistics": {
+    "total_samples": 977,
+    "einthoven": {
+      "available": 977,
+      "satisfied": 977,
+      "satisfaction_rate": 1.0,
+      "error_mean": 0.0007498018417015723,
+      "error_median": 0.000646490980834277,
+      "error_std": 0.0004717299278642502
+    },
+    "augmented_sum": {
+      "available": 977,
+      "satisfied": 977,
+      "satisfaction_rate": 1.0,
+      "error_mean": 0.0017606036344801537,
+      "error_median": 0.0014928571428571462,
+      "error_std": 0.001077153880492592
+    }
+  },
+  "sample_results": [
+    {
+      "ecg_id": "7663343",
+      "einthoven": {
+        "satisfied": 
