@@ -2,3 +2,4 @@ scratch.py
 experiments/
 __pycache__/
 inference_results/
+outputs/
