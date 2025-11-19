@@ -1,30 +1,33 @@
 #!/bin/bash
-# train.sh - ECG V45模型训练一键启动脚本
+# train.sh - ECG V47 CRNN模型训练一键启动脚本
 
 set -e  # 遇到错误立即退出
 
 # ==================== 配置区域 ====================
 
-# 数据路径（必须修改为您的实际路径）
-SIM_ROOT="/Volumes/movie/work/physionet-ecg-image-digitization-simulations-V45"
+# 数据路径（请修改为您的实际 V47 数据路径）
+# 注意：必须使用包含 gt_signals.json 的数据集
+SIM_ROOT="/Volumes/movie/work/physionet-ecg-image-digitization-simulations-V47"
 CSV_ROOT="/Volumes/movie/work/physionet-ecg-image-digitization/train"
 
 # 训练参数
-EPOCHS=100
+EPOCHS=50
 BATCH_SIZE=8
 LR=1e-4
 NUM_WORKERS=4
 TARGET_FS=500
-INPUT_SIZE="512 672"  # H W
+
+# 关键修改：输入宽度提升至 2048 以支持时序解码
+INPUT_SIZE="512 2048"  # H W 
 
 # 输出目录
 OUTPUT_DIR="./outputs"
 
-# 损失权重（V45关键配置）
-WEIGHT_PAPER_SPEED=5.0  # ⭐⭐⭐⭐⭐ 关键
-WEIGHT_GAIN=3.0         # ⭐⭐⭐
-WEIGHT_TEXT=2.0
-WEIGHT_LEAD_BASELINE=2.0
+# 损失权重（V47 新版配置）
+# Seg: 负责基线、文字、OCR定位
+# Signal: 负责波形数值回归 (L1 Loss)
+WEIGHT_SEG=1.0
+WEIGHT_SIGNAL=10.0    # 信号回归通常数值较小，给高权重以平衡
 
 # ==================================================
 
@@ -69,45 +72,15 @@ check_requirements() {
     echo ""
     echo "检查Python依赖..."
     
-    REQUIRED_PACKAGES=("torch" "torchvision" "numpy" "opencv-python" "albumentations" "pandas" "tqdm" "tensorboard")
-    MISSING_PACKAGES=()
-    
-    for pkg in "${REQUIRED_PACKAGES[@]}"; do
-        # 默认逻辑：将横杠替换为下划线
-        pkg_name=$(echo $pkg | sed 's/-/_/g')
-        
-        # --- 修复开始：特殊处理导入名称不一致的包 ---
-        if [ "$pkg" == "opencv-python" ]; then
-            import_name="cv2"
-        elif [ "$pkg" == "scikit-learn" ]; then
-            import_name="sklearn"  # 预防以后用到 sklearn
-        elif [ "$pkg" == "Pillow" ]; then
-            import_name="PIL"      # 预防以后用到 Pillow
-        else
-            import_name="$pkg_name"
-        fi
-        # --- 修复结束 ---
-
-        # 使用正确的 import_name 进行检查
-        if ! python -c "import ${import_name}" &> /dev/null; then
-            MISSING_PACKAGES+=("$pkg")
-            print_error "✗ 缺少依赖: $pkg (尝试导入: $import_name 失败)"
-        else
-            print_info "✓ $pkg"
-        fi
-    done
-    
-    if [ ${#MISSING_PACKAGES[@]} -gt 0 ]; then
-        echo ""
-        print_error "缺少以下依赖包，请先安装:"
-        echo "  pip install ${MISSING_PACKAGES[@]}"
+    # 检查PyTorch版本
+    if python -c "import torch" &> /dev/null; then
+        TORCH_VERSION=$(python -c 'import torch; print(torch.__version__)' 2>/dev/null)
+        print_info "PyTorch: $TORCH_VERSION"
+    else
+        print_error "未安装 PyTorch"
         exit 1
     fi
-    
-    # 检查PyTorch版本
-    TORCH_VERSION=$(python -c 'import torch; print(torch.__version__)' 2>/dev/null)
-    print_info "PyTorch: $TORCH_VERSION"
-    
+
     # 检测计算设备
     echo ""
     if python -c "import torch; assert torch.cuda.is_available()" &> /dev/null; then
@@ -149,9 +122,14 @@ check_requirements() {
     fi
     print_info "CSV数据: $CSV_ROOT"
     
-    # 统计样本数
-    SAMPLE_COUNT=$(find "$SIM_ROOT" -maxdepth 1 -type d -name "*_v*" 2>/dev/null | wc -l)
-    print_info "找到 $SAMPLE_COUNT 个仿真样本目录"
+    # 统计样本数 (V47文件结构检查)
+    # 检查是否包含 gt_signals.json
+    SAMPLE_COUNT=$(find "$SIM_ROOT" -maxdepth 2 -name "*_gt_signals.json" 2>/dev/null | wc -l)
+    if [ "$SAMPLE_COUNT" -eq 0 ]; then
+        print_warning "未找到 *_gt_signals.json 文件，请确认 SIM_ROOT 指向的是 V47 数据集"
+    else
+        print_info "找到 $SAMPLE_COUNT 个有效训练样本"
+    fi
     
     echo ""
 }
@@ -163,6 +141,7 @@ test_data_loading() {
     echo "测试前50个样本的数据加载..."
     echo ""
     
+    # 使用 ecg_dataset.py 的 main 函数进行测试
     python ecg_dataset.py \
         --sim_root "$SIM_ROOT" \
         --csv_root "$CSV_ROOT" \
@@ -177,8 +156,7 @@ test_data_loading() {
     else
         print_error "数据加载失败，请检查:"
         echo "  1. 数据路径是否正确"
-        echo "  2. 数据格式是否符合V45规范"
-        echo "  3. CSV文件是否存在"
+        echo "  2. 数据格式是否符合V47规范 (需包含 gt_signals.json)"
         exit 1
     fi
 }
@@ -191,12 +169,13 @@ debug_train() {
     echo "  样本数: 50"
     echo "  Epochs: 3"
     echo "  Batch Size: 4"
-    echo "  Workers: 0 (避免多进程问题)"
+    echo "  Workers: 0"
     echo ""
     
     DEBUG_OUTPUT="$OUTPUT_DIR/debug_run"
     mkdir -p "$DEBUG_OUTPUT"
     
+    # 更新后的参数列表
     python train.py \
         --sim_root "$SIM_ROOT" \
         --csv_root "$CSV_ROOT" \
@@ -209,11 +188,8 @@ debug_train() {
         --input_size $INPUT_SIZE \
         --target_fs $TARGET_FS \
         --pretrained \
-        --use_focal_loss \
-        --weight_paper_speed $WEIGHT_PAPER_SPEED \
-        --weight_gain $WEIGHT_GAIN \
-        --weight_text $WEIGHT_TEXT \
-        --weight_lead_baseline $WEIGHT_LEAD_BASELINE
+        --weight_seg $WEIGHT_SEG \
+        --weight_signal $WEIGHT_SIGNAL
     
     EXIT_CODE=$?
     
@@ -241,43 +217,16 @@ full_train() {
     echo "  Batch Size: $BATCH_SIZE"
     echo "  Learning Rate: $LR"
     echo "  Workers: $NUM_WORKERS"
-    echo "  Target FS: ${TARGET_FS}Hz"
     echo "  Input Size: $INPUT_SIZE"
     echo ""
     echo "损失权重:"
-    echo "  纸速OCR: $WEIGHT_PAPER_SPEED ⭐⭐⭐⭐⭐"
-    echo "  增益OCR: $WEIGHT_GAIN ⭐⭐⭐"
-    echo "  导联文字: $WEIGHT_TEXT"
-    echo "  细粒度基线: $WEIGHT_LEAD_BASELINE"
+    echo "  分割权重: $WEIGHT_SEG"
+    echo "  信号权重: $WEIGHT_SIGNAL"
     echo ""
     
-    # 创建输出目录
     mkdir -p "$TRAIN_OUTPUT"
     
-    # 保存配置
-    cat > "$TRAIN_OUTPUT/config.txt" << EOF
-训练配置 - $(date)
-========================
-数据:
-  SIM_ROOT: $SIM_ROOT
-  CSV_ROOT: $CSV_ROOT
-
-训练参数:
-  EPOCHS: $EPOCHS
-  BATCH_SIZE: $BATCH_SIZE
-  LR: $LR
-  NUM_WORKERS: $NUM_WORKERS
-  TARGET_FS: $TARGET_FS
-  INPUT_SIZE: $INPUT_SIZE
-
-损失权重:
-  WEIGHT_PAPER_SPEED: $WEIGHT_PAPER_SPEED
-  WEIGHT_GAIN: $WEIGHT_GAIN
-  WEIGHT_TEXT: $WEIGHT_TEXT
-  WEIGHT_LEAD_BASELINE: $WEIGHT_LEAD_BASELINE
-EOF
-    
-    # 启动训练
+    # 更新后的参数列表
     python train.py \
         --sim_root "$SIM_ROOT" \
         --csv_root "$CSV_ROOT" \
@@ -289,15 +238,11 @@ EOF
         --input_size $INPUT_SIZE \
         --target_fs $TARGET_FS \
         --pretrained \
-        --use_focal_loss \
         --scheduler cosine \
-        --weight_paper_speed $WEIGHT_PAPER_SPEED \
-        --weight_gain $WEIGHT_GAIN \
-        --weight_text $WEIGHT_TEXT \
-        --weight_lead_baseline $WEIGHT_LEAD_BASELINE \
-        --save_interval 10 \
-        --log_interval 10 \
-        --early_stop 20
+        --weight_seg $WEIGHT_SEG \
+        --weight_signal $WEIGHT_SIGNAL \
+        --save_interval 5 \
+        --log_interval 10
     
     EXIT_CODE=$?
     
@@ -305,22 +250,11 @@ EOF
         echo ""
         print_info "训练完成！"
         echo ""
-        print_info "模型检查点: $TRAIN_OUTPUT/checkpoint_best.pth"
-        print_info "TensorBoard日志: $TRAIN_OUTPUT/logs"
-        echo ""
-        print_info "启动TensorBoard查看训练曲线:"
+        print_info "启动TensorBoard:"
         echo "  tensorboard --logdir $TRAIN_OUTPUT/logs --port 6006"
-        echo ""
-        print_info "运行推理测试:"
-        echo "  python inference.py --checkpoint $TRAIN_OUTPUT/checkpoint_best.pth --image /path/to/test.png --output_dir ./results"
         echo ""
     else
         print_error "训练失败（退出码: $EXIT_CODE）"
-        echo ""
-        print_warning "请检查:"
-        echo "  1. 显存/内存是否充足（尝试减小 BATCH_SIZE）"
-        echo "  2. 数据路径是否正确"
-        echo "  3. 查看错误日志: $TRAIN_OUTPUT/logs/"
         exit $EXIT_CODE
     fi
 }
@@ -329,24 +263,23 @@ EOF
 resume_train() {
     print_header "恢复训练"
     
-    # 查找最新的检查点
     LATEST_CHECKPOINT=$(find "$OUTPUT_DIR" -name "checkpoint_latest.pth" -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
     
     if [ -z "$LATEST_CHECKPOINT" ]; then
         print_error "未找到检查点文件"
-        echo "请手动指定检查点路径:"
+        echo "请手动指定:"
         echo "  python train.py --resume /path/to/checkpoint.pth ..."
         exit 1
     fi
     
     print_info "找到检查点: $LATEST_CHECKPOINT"
-    
     RESUME_DIR=$(dirname "$LATEST_CHECKPOINT")
     
     echo ""
-    read -p "是否从此检查点恢复训练？[y/N] " yn
+    read -p "是否恢复训练？[y/N] " yn
     case $yn in
         [Yy]*)
+            # 更新后的参数列表
             python train.py \
                 --sim_root "$SIM_ROOT" \
                 --csv_root "$CSV_ROOT" \
@@ -357,7 +290,9 @@ resume_train() {
                 --lr $LR \
                 --num_workers $NUM_WORKERS \
                 --input_size $INPUT_SIZE \
-                --target_fs $TARGET_FS
+                --target_fs $TARGET_FS \
+                --weight_seg $WEIGHT_SEG \
+                --weight_signal $WEIGHT_SIGNAL
             
             if [ $? -eq 0 ]; then
                 print_info "训练完成！"
@@ -376,7 +311,7 @@ resume_train() {
 # 主菜单
 show_menu() {
     echo ""
-    print_header "ECG V45 模型训练"
+    print_header "ECG V47 CRNN 模型训练"
     echo ""
     echo "数据路径:"
     echo "  仿真数据: $SIM_ROOT"
@@ -394,137 +329,40 @@ show_menu() {
     read -p "输入选项 [0-6]: " choice
     
     case $choice in
-        1)
-            check_requirements
-            ;;
-        2)
-            check_requirements
-            test_data_loading
-            ;;
-        3)
-            check_requirements
-            debug_train
-            ;;
-        4)
-            check_requirements
-            full_train
-            ;;
-        5)
-            check_requirements
-            resume_train
-            ;;
-        6)
-            # 一键运行
-            check_requirements
-            
-            echo ""
-            read -p "环境检查完成，继续测试数据加载？[Y/n] " yn
-            case $yn in
-                [Nn]*)
-                    print_info "跳过数据测试"
-                    ;;
-                *)
-                    test_data_loading
-                    ;;
-            esac
-            
-            echo ""
-            read -p "是否运行快速调试训练？[Y/n] " yn
-            case $yn in
-                [Nn]*)
-                    print_info "跳过调试训练"
-                    ;;
-                *)
-                    debug_train
-                    ;;
-            esac
-            
-            echo ""
-            read -p "是否开始完整训练？[Y/n] " yn
-            case $yn in
-                [Nn]*)
-                    print_info "已取消完整训练"
-                    exit 0
-                    ;;
-                *)
-                    full_train
-                    ;;
-            esac
-            ;;
-        0)
-            print_info "已退出"
-            exit 0
-            ;;
-        *)
-            print_error "无效选项"
-            exit 1
-            ;;
+        1) check_requirements ;;
+        2) check_requirements; test_data_loading ;;
+        3) check_requirements; debug_train ;;
+        4) check_requirements; full_train ;;
+        5) check_requirements; resume_train ;;
+        6) 
+           check_requirements
+           test_data_loading
+           debug_train
+           full_train
+           ;;
+        0) print_info "已退出"; exit 0 ;;
+        *) print_error "无效选项"; exit 1 ;;
     esac
 }
 
 # ==================== 主程序 ====================
 
-# 显示脚本信息
-cat << "EOF"
-  _____ ____ ____   __     _____ ____  
- | ____/ ___/ ___| /  \   |_   _|  _ \ 
- |  _|| |  | |  _ | () |    | | | |_) |
- | |__| |__| |_| | \__/     | | |  _ < 
- |_____\____\____|           |_| |_| \_\
-                                         
- ECG V45 渐进式导联定位模型训练
- Version: 1.0
- 
-EOF
-
-# 检查是否在正确目录
+# 检查必需文件是否存在
 if [ ! -f "train.py" ]; then
     print_error "请在包含 train.py 的目录下运行此脚本"
     exit 1
 fi
 
-# 如果提供了命令行参数，直接执行
 if [ $# -gt 0 ]; then
     case $1 in
-        check)
-            check_requirements
-            ;;
-        test)
-            check_requirements
-            test_data_loading
-            ;;
-        debug)
-            check_requirements
-            debug_train
-            ;;
-        train)
-            check_requirements
-            full_train
-            ;;
-        resume)
-            check_requirements
-            resume_train
-            ;;
-        all)
-            check_requirements
-            test_data_loading
-            debug_train
-            full_train
-            ;;
-        *)
-            echo "用法: $0 [check|test|debug|train|resume|all]"
-            echo ""
-            echo "命令说明:"
-            echo "  check  - 检查环境和数据"
-            echo "  test   - 测试数据加载"
-            echo "  debug  - 快速调试训练"
-            echo "  train  - 完整训练"
-            echo "  resume - 恢复训练"
-            echo "  all    - 一键运行所有步骤"
-            exit 1
-            ;;
+        check) check_requirements ;;
+        test) check_requirements; test_data_loading ;;
+        debug) check_requirements; debug_train ;;
+        train) check_requirements; full_train ;;
+        resume) check_requirements; resume_train ;;
+        all) check_requirements; test_data_loading; debug_train; full_train ;;
+        *) echo "用法: $0 [check|test|debug|train|resume|all]"; exit 1 ;;
     esac
 else
-    # 交互式菜单
     show_menu
 fi

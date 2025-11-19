@@ -1,535 +1,301 @@
 """
-ECG V45 渐进式导联定位模型
+ECG V47 Model Architecture
+基于 CRNN 和 渐进式导联定位 (Locate-Crop-Decode)
 
-架构设计:
-- 编码器: ResNet-50 + FPN
-- 粗层路径(H/16): 基线热图 + 时间范围估计
-- 细层路径(H/4): 文字掩码(13层) + 辅助元素 + OCR
-- 融合模块: 导联级基线定位(12层)
-- 信号解码器: STN校正 + 1D-CNN解码
-
-特点:
-1. ✅ 多尺度特征提取 (FPN)
-2. ✅ 渐进式定位 (粗->细)
-3. ✅ OCR优先 (纸速⭐⭐⭐⭐⭐ + 增益⭐⭐⭐)
-4. ✅ 几何校正 (STN)
-5. ✅ 端到端训练
+核心组件:
+1. ResNet50-FPN: 提取高分辨率特征 (d2 stride=4)
+2. Localization Heads: 预测每个导联的基线位置
+3. RoI Extractor: 基于基线从特征图动态裁剪条带
+4. CRNN Decoder: 垂直CNN压缩 + 水平BiGRU序列建模
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import resnet50, ResNet50_Weights
-from torchvision.ops import roi_align
 from typing import Dict, List, Tuple, Optional
 
-
-class SpatialTransformerNetwork(nn.Module):
+class CRNNLeadDecoder(nn.Module):
     """
-    空间变换网络 (STN)
-    用于几何校正 (矫正图像中的扭曲、倾斜等)
+    CRNN 解码器
+    输入: (B*12, C, H_roi, W_roi) - 裁剪出的特征条带
+    输出: (B*12, W_roi) - 预测的 1D 信号 (像素偏移量)
     """
-    
-    def __init__(self, in_channels: int):
+    def __init__(self, in_channels=256, hidden_size=128, roi_height=32):
         super().__init__()
         
-        # 定位网络 (预测仿射变换参数)
-        self.localization = nn.Sequential(
-            nn.Conv2d(in_channels, 64, kernel_size=7, padding=3),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            nn.MaxPool2d(2, 2),
+        # 1. CNN Encoder: 垂直方向特征压缩
+        # 目标: 将高度 H_roi (32) 压缩到 1，同时保留波形特征
+        self.cnn = nn.Sequential(
+            # Layer 1: 32 -> 16
+            nn.Conv2d(in_channels, 128, kernel_size=(3, 3), padding=(1, 1)),
+            nn.BatchNorm2d(128), nn.ReLU(True),
+            nn.MaxPool2d(kernel_size=(2, 1)), 
             
-            nn.Conv2d(64, 128, kernel_size=5, padding=2),
-            nn.BatchNorm2d(128),
-            nn.ReLU(True),
-            nn.MaxPool2d(2, 2),
+            # Layer 2: 16 -> 8
+            nn.Conv2d(128, 64, kernel_size=(3, 3), padding=(1, 1)),
+            nn.BatchNorm2d(64), nn.ReLU(True),
+            nn.MaxPool2d(kernel_size=(2, 1)),
             
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
+            # Layer 3: 8 -> 1 (垂直全卷积)
+            nn.Conv2d(64, 64, kernel_size=(8, 1), padding=0),
+            nn.BatchNorm2d(64), nn.ReLU(True)
+        )
+        
+        # 2. RNN Sequence Modeling: 水平方向时序建模
+        # 处理波形上下文，平滑噪声
+        self.rnn = nn.GRU(
+            input_size=64, 
+            hidden_size=hidden_size, 
+            num_layers=2, 
+            batch_first=True, 
+            bidirectional=True
+        )
+        
+        # 3. Regressor Head
+        # 输出: 像素偏移量 (相对于基线)
+        self.head = nn.Sequential(
+            nn.Linear(hidden_size * 2, 64),
             nn.ReLU(True),
-            nn.MaxPool2d(2, 2)
+            nn.Linear(64, 1)
         )
-        
-        # 全连接层回归仿射变换参数 (2x3矩阵)
-        self.fc_loc = nn.Sequential(
-            nn.Linear(256 * 4 * 4, 256),
-            nn.ReLU(True),
-            nn.Dropout(0.2),
-            nn.Linear(256, 6)
-        )
-        
-        # 初始化为恒等变换
-        self.fc_loc[3].weight.data.zero_()
-        self.fc_loc[3].bias.data.copy_(
-            torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float)
-        )
-    
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x: (B, C, H, W) 输入特征
-        
-        Returns:
-            x_transformed: (B, C, H, W) 校正后的特征
-            theta: (B, 2, 3) 仿射变换矩阵
-        """
-        xs = self.localization(x)
-        xs = F.adaptive_avg_pool2d(xs, (4, 4))
-        xs = xs.view(xs.size(0), -1)
-        
-        theta = self.fc_loc(xs)
-        theta = theta.view(-1, 2, 3)
-        
-        # 应用仿射变换
-        grid = F.affine_grid(theta, x.size(), align_corners=False)
-        x_transformed = F.grid_sample(x, grid, align_corners=False)
-        
-        return x_transformed, theta
 
-
-class LeadSignalDecoder(nn.Module):
-    """
-    单导联信号解码器
-    从2D特征图解码出1D信号
-    """
-    
-    def __init__(self, in_channels: int = 256):
-        super().__init__()
+    def forward(self, x):
+        # x: (Batch_Size * 12, C, H, W)
         
-        # 1D卷积解码
-        self.decoder = nn.Sequential(
-            nn.Conv1d(in_channels, 128, kernel_size=3, padding=1),
-            nn.BatchNorm1d(128),
-            nn.ReLU(True),
-            
-            nn.Conv1d(128, 64, kernel_size=3, padding=1),
-            nn.BatchNorm1d(64),
-            nn.ReLU(True),
-            
-            nn.Conv1d(64, 32, kernel_size=3, padding=1),
-            nn.BatchNorm1d(32),
-            nn.ReLU(True),
-            
-            nn.Conv1d(32, 1, kernel_size=1)
-        )
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, C, H, W) RoI特征
+        # CNN 提取
+        # out: (B', 64, 1, W)
+        feat = self.cnn(x)
         
-        Returns:
-            signal: (B, W) 1D信号
-        """
-        # 沿高度方向平均池化
-        x = x.mean(dim=2)  # (B, C, W)
+        # 调整维度适配 RNN
+        # (B', 64, W) -> (B', W, 64)
+        feat = feat.squeeze(2).permute(0, 2, 1)
         
-        # 1D卷积解码
-        signal = self.decoder(x)  # (B, 1, W)
-        signal = signal.squeeze(1)  # (B, W)
+        # RNN 建模
+        # out: (B', W, hidden*2)
+        rnn_out, _ = self.rnn(feat)
+        
+        # 回归预测
+        # out: (B', W, 1) -> (B', W)
+        signal = self.head(rnn_out).squeeze(-1)
         
         return signal
 
 
 class ProgressiveLeadLocalizationModel(nn.Module):
     """
-    渐进式导联定位模型
-    
-    特点:
-    - 从粗到细的导联定位
-    - OCR优先 (纸速⭐⭐⭐⭐⭐ + 增益⭐⭐⭐)
-    - 多任务学习
+    主模型架构
     """
-    
     def __init__(self, 
-                 num_leads: int = 12,
-                 encoder_name: str = 'resnet50',
-                 pretrained: bool = True):
+                 num_leads=12, 
+                 roi_height=32,  # 在特征图上的裁剪高度
+                 pretrained=True):
         super().__init__()
-        
         self.num_leads = num_leads
+        self.roi_height = roi_height
         
-        # ============================================================
-        # 编码器 (ResNet-50 + FPN)
-        # ============================================================
-        if encoder_name == 'resnet50':
-            backbone = resnet50(
-                weights=ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
-            )
-            
-            # 提取各层特征
-            self.conv1 = backbone.conv1
-            self.bn1 = backbone.bn1
-            self.relu = backbone.relu
-            self.maxpool = backbone.maxpool
-            
-            # ResNet-50的标准通道数
-            self.layer1 = backbone.layer1  # 1/4,  256 channels
-            self.layer2 = backbone.layer2  # 1/8,  512 channels
-            self.layer3 = backbone.layer3  # 1/16, 1024 channels
-            self.layer4 = backbone.layer4  # 1/32, 2048 channels
-            
-            # FPN lateral connections (统一到256通道)
-            self.lateral5 = nn.Conv2d(2048, 256, kernel_size=1)  # c4 -> p5
-            self.lateral4 = nn.Conv2d(1024, 256, kernel_size=1)  # c3 -> p4
-            self.lateral3 = nn.Conv2d(512, 256, kernel_size=1)   # c2 -> p3
-            self.lateral2 = nn.Conv2d(256, 256, kernel_size=1)   # c1 -> p2
-            
-            # FPN smooth layers (减少上采样的混叠效应)
-            self.smooth5 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
-            self.smooth4 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
-            self.smooth3 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
-            self.smooth2 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
+        # ================== 1. Backbone + FPN ==================
+        backbone = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1 if pretrained else None)
         
-        # ============================================================
-        # 粗层路径 (从d4预测, H/16分辨率)
-        # ============================================================
+        # 提取各层 (Stem, c1, c2, c3, c4)
+        self.enc0 = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool)
+        self.enc1 = backbone.layer1
+        self.enc2 = backbone.layer2
+        self.enc3 = backbone.layer3
+        self.enc4 = backbone.layer4
         
-        # 粗粒度基线热图 (单通道, 不区分导联)
-        self.coarse_baseline_head = nn.Sequential(
-            nn.Conv2d(256, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(True),
-            nn.Conv2d(128, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            nn.Conv2d(64, 1, kernel_size=1),
-            nn.Sigmoid()
+        # FPN Lateral Connections
+        self.lat4 = nn.Conv2d(2048, 256, 1)
+        self.lat3 = nn.Conv2d(1024, 256, 1)
+        self.lat2 = nn.Conv2d(512, 256, 1)
+        self.lat1 = nn.Conv2d(256, 256, 1)
+        
+        # FPN Smooth Layers
+        self.smooth = nn.Conv2d(256, 256, 3, padding=1)
+        
+        # ================== 2. Localization Heads ==================
+        # 粗定位 (H/16)
+        self.head_coarse = nn.Sequential(
+            nn.Conv2d(256, 128, 3, padding=1), nn.ReLU(True),
+            nn.Conv2d(128, 1, 1), nn.Sigmoid()
         )
         
-        # 时间范围估计 (每个导联2个值: start, end)
-        self.time_range_head = nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(256, 128),
-            nn.ReLU(True),
-            nn.Dropout(0.2),
-            nn.Linear(128, num_leads * 2)  # 12导联 x 2
+        # 文字定位 (H/4)
+        self.head_text = nn.Sequential(
+            nn.Conv2d(256, 128, 3, padding=1), nn.ReLU(True),
+            nn.Conv2d(128, 13, 1), nn.Sigmoid() # 12 leads + background
         )
         
-        # ============================================================
-        # 细层路径 (从d2预测, H/4分辨率)
-        # ============================================================
-        
-        # 导联文字掩码 (13通道: 12导联 + 1背景)
-        self.text_head = nn.Sequential(
-            nn.Conv2d(256, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(True),
-            nn.Conv2d(128, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            nn.Conv2d(64, 13, kernel_size=1),
-            nn.Sigmoid()
+        # OCR Heads (辅助任务)
+        self.head_ocr = nn.Sequential(
+            nn.Conv2d(256, 64, 3, padding=1), nn.ReLU(True),
+            nn.Conv2d(64, 2, 1), nn.Sigmoid() # [Speed, Gain] masks
         )
         
-        # 辅助元素掩码 (定标脉冲 + 分隔符)
-        self.auxiliary_head = nn.Sequential(
-            nn.Conv2d(256, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(True),
-            nn.Conv2d(32, 1, kernel_size=1),
-            nn.Sigmoid()
+        # 精细基线融合头
+        # Input: Feature(256) + Coarse(1) + Text(13)
+        self.head_fusion = nn.Sequential(
+            nn.Conv2d(256 + 1 + 13, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(True),
+            nn.Conv2d(256, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(True),
+            nn.Conv2d(128, num_leads, 1), nn.Sigmoid()
         )
         
-        # ============================================================
-        # OCR分支 (V45新增)
-        # ============================================================
-        
-        # 纸速OCR掩码 (关键性 ⭐⭐⭐⭐⭐)
-        self.paper_speed_head = nn.Sequential(
-            nn.Conv2d(256, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(True),
-            nn.Conv2d(128, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            nn.Conv2d(64, 1, kernel_size=1),
-            nn.Sigmoid()
-        )
-        
-        # 增益OCR掩码 (关键性 ⭐⭐⭐)
-        self.gain_head = nn.Sequential(
-            nn.Conv2d(256, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(True),
-            nn.Conv2d(128, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            nn.Conv2d(64, 1, kernel_size=1),
-            nn.Sigmoid()
-        )
-        
-        # ============================================================
-        # 融合与导联定位模块
-        # ============================================================
-        
-        # 特征融合 (粗基线 + 文字 + 辅助 + d2特征)
-        # 输入通道数: 256(d2) + 1(粗基线) + 13(文字) + 1(辅助) = 271
-        self.fusion_conv = nn.Sequential(
-            nn.Conv2d(271, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(True),
-            nn.Conv2d(256, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(True)
-        )
-        
-        # 生成每个导联的基线掩码
-        self.lead_baseline_head = nn.Sequential(
-            nn.Conv2d(128, num_leads, kernel_size=1),
-            nn.Sigmoid()
-        )
-        
-        # ============================================================
-        # 高分辨率波形解码器 (可选, 推理时使用)
-        # ============================================================
-        self.wave_decoder = nn.ModuleList([
-            LeadSignalDecoder(in_channels=256) for _ in range(num_leads)
-        ])
-        
-        # STN用于RoI校正
-        self.stn = SpatialTransformerNetwork(in_channels=256)
-    
-    def forward_encoder(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        # ================== 3. Decoder ==================
+        self.decoder = CRNNLeadDecoder(in_channels=256, roi_height=roi_height)
+
+    def _upsample_add(self, x, y):
+        """FPN 上采样相加辅助函数"""
+        return F.interpolate(x, size=y.shape[-2:], mode='bilinear', align_corners=False) + y
+
+    def extract_rois(self, feature_map, baselines):
         """
-        前向编码器，提取多尺度特征
+        动态 RoI 提取核心逻辑
         
         Args:
-            x: (B, 3, H, W) 输入图像
-        
+            feature_map: (B, 256, H, W) - FPN 特征图 (d2)
+            baselines: (B, 12, H, W) - 预测的基线热图
+            
         Returns:
-            features: 字典 {
-                'd2': (B, 256, H/4, W/4),
-                'd3': (B, 256, H/8, W/8),
-                'd4': (B, 256, H/16, W/16),
-                'd5': (B, 256, H/32, W/32)
-            }
+            rois: (B*12, 256, roi_height, W)
         """
-        # Stem
-        x = self.conv1(x)      # (B, 64, H/2, W/2)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)    # (B, 64, H/4, W/4)
+        B, C, H, W = feature_map.shape
+        device = feature_map.device
         
-        # ResNet stages
-        c1 = self.layer1(x)    # (B, 256, H/4, W/4)
-        c2 = self.layer2(c1)   # (B, 512, H/8, W/8)
-        c3 = self.layer3(c2)   # (B, 1024, H/16, W/16)
-        c4 = self.layer4(c3)   # (B, 2048, H/32, W/32)
+        # 1. 从热图中计算 Y 轴中心 (Soft Argmax)
+        # 将热图沿 W 轴平均，得到 Y 轴分布
+        y_dist = baselines.mean(dim=3) # (B, 12, H)
         
-        # FPN top-down pathway
-        # 从最深层开始
-        p5 = self.lateral5(c4)  # (B, 256, H/32, W/32)
-        p5 = self.smooth5(p5)
+        # 生成 [-1, 1] 的坐标网格
+        pos_y = torch.linspace(-1, 1, H, device=device).view(1, 1, H)
         
-        # p4: 融合c3和上采样的p5
-        p4 = self.lateral4(c3) + F.interpolate(p5, scale_factor=2, mode='nearest')
-        p4 = self.smooth4(p4)   # (B, 256, H/16, W/16)
+        # 计算期望: Sum(P * y) / Sum(P)
+        weights = y_dist / (y_dist.sum(dim=2, keepdim=True) + 1e-6)
+        centers_y = (weights * pos_y).sum(dim=2) # (B, 12)
         
-        # p3: 融合c2和上采样的p4
-        p3 = self.lateral3(c2) + F.interpolate(p4, scale_factor=2, mode='nearest')
-        p3 = self.smooth3(p3)   # (B, 256, H/8, W/8)
+        # 2. 构建 Grid Sample 的采样网格
+        # 我们需要为每个 (Batch, Lead) 构建一个网格
+        # Grid Shape: (B*12, roi_height, W, 2)
         
-        # p2: 融合c1和上采样的p3
-        p2 = self.lateral2(c1) + F.interpolate(p3, scale_factor=2, mode='nearest')
-        p2 = self.smooth2(p2)   # (B, 256, H/4, W/4)
+        # 归一化半高
+        half_h = (self.roi_height / H)
         
-        return {
-            'd2': p2,  # H/4  - 用于细层预测
-            'd3': p3,  # H/8
-            'd4': p4,  # H/16 - 用于粗层预测
-            'd5': p5   # H/32
-        }
-    
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        前向传播
+        # 基础 Y 网格: [-half_h, half_h]
+        base_grid_y = torch.linspace(-half_h, half_h, self.roi_height, device=device)
+        base_grid_y = base_grid_y.view(1, 1, self.roi_height, 1)
         
-        Args:
-            x: (B, 3, H, W) 输入图像
+        # 扩展 centers_y 以匹配网格维度
+        # centers_y: (B, 12) -> (B*12, 1, 1, 1)
+        centers_flat = centers_y.view(-1, 1, 1, 1)
         
-        Returns:
-            outputs: 字典 {
-                'coarse_baseline': (B, 1, H/16, W/16),
-                'time_ranges': (B, 12, 2),
-                'text_masks': (B, 13, H/4, W/4),
-                'auxiliary_mask': (B, 1, H/4, W/4),
-                'paper_speed_mask': (B, 1, H/4, W/4),
-                'gain_mask': (B, 1, H/4, W/4),
-                'lead_baselines': (B, 12, H/4, W/4),
-                # 以下仅推理时
-                'lead_bboxes': (B, 12, 4),  [可选]
-                'signals': List[Tensor]      [可选]
-            }
-        """
-        B, _, H, W = x.shape
+        # 最终 Y 坐标: center + local_offset
+        final_grid_y = centers_flat + base_grid_y
+        final_grid_y = final_grid_y.expand(-1, -1, -1, W) # 沿 W 轴复制
         
-        # ========== 1. 编码器 ==========
-        features = self.forward_encoder(x)
-        d2, d3, d4, d5 = (
-            features['d2'], features['d3'], 
-            features['d4'], features['d5']
-        )
+        # 基础 X 网格: [-1, 1]
+        base_grid_x = torch.linspace(-1, 1, W, device=device).view(1, 1, 1, W)
+        final_grid_x = base_grid_x.expand(B*self.num_leads, -1, self.roi_height, -1)
         
-        # ========== 2. 粗层预测 (从d4) ==========
-        coarse_baseline = self.coarse_baseline_head(d4)  # (B, 1, H/16, W/16)
+        # 拼接得到采样 Grid (x, y)
+        grid = torch.cat([final_grid_x, final_grid_y], dim=1)
+        grid = grid.permute(0, 2, 3, 1) # (B*12, roi_height, W, 2)
         
-        time_ranges = self.time_range_head(d4)           # (B, 12*2)
-        time_ranges = time_ranges.view(B, self.num_leads, 2)
+        # 3. 执行采样
+        # 特征图需要 repeat: (B, C, H, W) -> (B*12, C, H, W)
+        feat_repeat = feature_map.repeat_interleave(self.num_leads, dim=0)
         
-        # ========== 3. 细层预测 (从d2) ==========
-        text_masks = self.text_head(d2)                  # (B, 13, H/4, W/4)
-        auxiliary_mask = self.auxiliary_head(d2)         # (B, 1, H/4, W/4)
+        rois = F.grid_sample(feat_repeat, grid, align_corners=False)
         
-        # ========== 4. OCR预测 (从d2) ==========
-        paper_speed_mask = self.paper_speed_head(d2)     # (B, 1, H/4, W/4)
-        gain_mask = self.gain_head(d2)                   # (B, 1, H/4, W/4)
+        return rois
+
+    def forward(self, x):
+        # x: (B, 3, H, W)
         
-        # ========== 5. 融合与导联定位 ==========
-        # 上采样粗基线到H/4
-        coarse_baseline_up = F.interpolate(
-            coarse_baseline, 
-            size=(H//4, W//4), 
-            mode='bilinear', 
-            align_corners=False
-        )
+        # ================== Encoder (ResNet) ==================
+        # C1 (H/4), C2 (H/4), C3 (H/8), C4 (H/16), C5 (H/32)
+        c1 = self.enc0(x)
+        c2 = self.enc1(c1)
+        c3 = self.enc2(c2)
+        c4 = self.enc3(c3)
+        c5 = self.enc4(c4)
         
-        # 拼接所有特征
-        fusion_input = torch.cat([
-            d2,                     # (B, 256, H/4, W/4)
-            coarse_baseline_up,     # (B, 1, H/4, W/4)
-            text_masks,             # (B, 13, H/4, W/4)
-            auxiliary_mask          # (B, 1, H/4, W/4)
-        ], dim=1)  # (B, 271, H/4, W/4)
+        # ================== FPN ==================
+        p5 = self.lat4(c5)
+        p4 = self.lat3(c4) + F.interpolate(p5, scale_factor=2, mode='nearest')
+        p3 = self.lat2(c3) + F.interpolate(p4, scale_factor=2, mode='nearest')
+        p2 = self.lat1(c2) + F.interpolate(p3, scale_factor=2, mode='nearest')
         
-        fusion_feat = self.fusion_conv(fusion_input)     # (B, 128, H/4, W/4)
-        lead_baselines = self.lead_baseline_head(fusion_feat)  # (B, 12, H/4, W/4)
+        # 融合层: d2 (H/4) 是主要的高分辨率特征
+        d2 = self.smooth(p2) 
+        # d4 (H/16) 用于粗定位
+        d4 = F.avg_pool2d(d2, kernel_size=4, stride=4) 
         
-        # ========== 6. 输出 ==========
+        # ================== Localization Heads ==================
+        coarse_baseline = self.head_coarse(d4)
+        text_masks = self.head_text(d2)
+        ocr_maps = self.head_ocr(d2)
+        
+        # 精细基线预测
+        # 上采样粗基线到 H/4
+        coarse_up = F.interpolate(coarse_baseline, size=d2.shape[-2:], mode='bilinear', align_corners=False)
+        # 融合特征
+        fusion_feat = torch.cat([d2, coarse_up, text_masks], dim=1)
+        lead_baselines = self.head_fusion(fusion_feat) # (B, 12, H/4, W/4)
+        
         outputs = {
             'coarse_baseline': coarse_baseline,
-            'time_ranges': time_ranges,
             'text_masks': text_masks,
-            'auxiliary_mask': auxiliary_mask,
-            'paper_speed_mask': paper_speed_mask,
-            'gain_mask': gain_mask,
-            'lead_baselines': lead_baselines,
+            'ocr_maps': ocr_maps,
+            'lead_baselines': lead_baselines
         }
         
-        # ========== 7. 高分辨率信号解码 (仅推理时) ==========
-        if not self.training:
-            # 这部分在实际使用时可以根据需要实现
-            # 这里提供简化版本
-            pass
-        
+        # ================== Decode Signals ==================
+        # 仅在训练或推理模式下需要信号时运行
+        # 可以通过 self.training 自动判断，或者显式调用
+        if True: 
+            # 1. 提取 RoIs (B*12, 256, 32, W/4)
+            lead_rois = self.extract_rois(d2, lead_baselines)
+            
+            # 2. CRNN 解码 (B*12, W/4)
+            raw_signals = self.decoder(lead_rois)
+            
+            # 3. Reshape 回 (B, 12, W/4)
+            B = x.shape[0]
+            W_feat = d2.shape[-1]
+            pred_signals = raw_signals.view(B, self.num_leads, W_feat)
+            
+            # 输出的是像素偏移量，需要除以 Gain (在 Loss 中做)
+            outputs['signals'] = pred_signals 
+            
         return outputs
+
+# =============================================================================
+# 模块测试
+# =============================================================================
+if __name__ == "__main__":
+    print("Testing ProgressiveLeadLocalizationModel...")
     
-    def extract_roi_from_masks(self, 
-                               baseline_mask: torch.Tensor, 
-                               text_mask: torch.Tensor) -> torch.Tensor:
-        """
-        从基线和文字掩码提取RoI边界框
-        
-        Args:
-            baseline_mask: (H, W) 基线掩码
-            text_mask: (H, W) 文字掩码
-        
-        Returns:
-            bbox: (4,) [x1, y1, x2, y2]
-        """
-        H, W = baseline_mask.shape
-        
-        # 合并基线和文字掩码
-        combined = (baseline_mask + text_mask).clamp(0, 1)
-        
-        # 找到非零像素
-        nonzero = torch.nonzero(combined > 0.5)
-        
-        if len(nonzero) == 0:
-            # 返回默认框
-            return torch.tensor([0, 0, W-1, H-1], dtype=torch.float32, device=baseline_mask.device)
-        
-        y_min, x_min = nonzero.min(dim=0)[0]
-        y_max, x_max = nonzero.max(dim=0)[0]
-        
-        # 添加边距
-        margin = 10
-        x_min = max(0, x_min - margin)
-        y_min = max(0, y_min - margin)
-        x_max = min(W - 1, x_max + margin)
-        y_max = min(H - 1, y_max + margin)
-        
-        return torch.tensor([x_min, y_min, x_max, y_max], dtype=torch.float32, device=baseline_mask.device)
-
-
-# ============================================================
-# 测试代码
-# ============================================================
-
-if __name__ == '__main__':
-    print("="*80)
-    print("ECG V45 模型测试")
-    print("="*80)
-    
-    # 创建模型
-    model = ProgressiveLeadLocalizationModel(
-        num_leads=12, 
-        encoder_name='resnet50',
-        pretrained=False
-    )
+    # 1. 创建模型
+    model = ProgressiveLeadLocalizationModel(num_leads=12, pretrained=False)
     model.eval()
     
-    # 模拟输入
-    batch_size = 2
-    H, W = 512, 672
-    x = torch.randn(batch_size, 3, H, W)
+    # 2. 创建 Dummy 输入 (B=2, C=3, H=512, W=2048)
+    # 注意宽度 2048 适配 test.csv 中的高频信号需求
+    dummy_input = torch.randn(2, 3, 512, 2048)
     
-    print(f"\n输入形状: {x.shape}")
+    print(f"Input Shape: {dummy_input.shape}")
     
-    # 前向传播
+    # 3. 前向传播
     with torch.no_grad():
-        outputs = model(x)
+        outputs = model(dummy_input)
+        
+    # 4. 验证输出形状
+    print("\nOutput Shapes:")
+    print(f"Coarse Baseline: {outputs['coarse_baseline'].shape} (Expected: B, 1, H/16, W/16)")
+    print(f"Lead Baselines: {outputs['lead_baselines'].shape} (Expected: B, 12, H/4, W/4)")
+    print(f"Signals: {outputs['signals'].shape} (Expected: B, 12, W/4)")
     
-    # 打印输出
-    print("\n模型输出:")
-    print("-" * 80)
-    for key, val in outputs.items():
-        if isinstance(val, torch.Tensor):
-            print(f"  {key:25s}: {val.shape}")
-        else:
-            print(f"  {key:25s}: {type(val)}")
+    # 检查信号长度
+    expected_len = 2048 // 4
+    assert outputs['signals'].shape[-1] == expected_len, f"Signal length mismatch: got {outputs['signals'].shape[-1]}, expected {expected_len}"
     
-    # 统计参数量
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
-    print("\n" + "="*80)
-    print("模型统计:")
-    print("="*80)
-    print(f"总参数量:       {total_params:,}")
-    print(f"可训练参数量:   {trainable_params:,}")
-    print(f"参数大小:       {total_params * 4 / 1024 / 1024:.2f} MB (FP32)")
-    print("="*80)
-    
-    # 测试各个输出的形状
-    assert outputs['coarse_baseline'].shape == (batch_size, 1, H//16, W//16), \
-        f"coarse_baseline shape mismatch: {outputs['coarse_baseline'].shape}"
-    assert outputs['time_ranges'].shape == (batch_size, 12, 2), \
-        f"time_ranges shape mismatch: {outputs['time_ranges'].shape}"
-    assert outputs['text_masks'].shape == (batch_size, 13, H//4, W//4), \
-        f"text_masks shape mismatch: {outputs['text_masks'].shape}"
-    assert outputs['auxiliary_mask'].shape == (batch_size, 1, H//4, W//4), \
-        f"auxiliary_mask shape mismatch: {outputs['auxiliary_mask'].shape}"
-    assert outputs['paper_speed_mask'].shape == (batch_size, 1, H//4, W//4), \
-        f"paper_speed_mask shape mismatch: {outputs['paper_speed_mask'].shape}"
-    assert outputs['gain_mask'].shape == (batch_size, 1, H//4, W//4), \
-        f"gain_mask shape mismatch: {outputs['gain_mask'].shape}"
-    assert outputs['lead_baselines'].shape == (batch_size, 12, H//4, W//4), \
-        f"lead_baselines shape mismatch: {outputs['lead_baselines'].shape}"
-    
-    print("\n✓ 所有测试通过！")
+    print("\n✓ Model test passed!")
