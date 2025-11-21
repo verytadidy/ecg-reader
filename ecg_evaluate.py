@@ -1,7 +1,6 @@
 """
-ECG V48 独立评估脚本 - 完全重写版本 (集成高级对齐)
+ECG V48 独立评估脚本 - 完全重写版本
 不依赖任何旧代码，避免缓存问题
-包含时间偏移搜索以最大化相关系数
 """
 
 import os
@@ -32,118 +31,6 @@ class Colors:
 
 def print_c(text, color=Colors.ENDC):
     print(f"{color}{text}{Colors.ENDC}")
-
-
-# ============ 高级对齐器 ============
-class ECGSignalAligner:
-    """ECG 信号对齐器 - 时间偏移搜索"""
-    
-    @staticmethod
-    def resample_1d(x, target_len):
-        """1D 插值重采样"""
-        if len(x) == target_len:
-            return x
-        x_old = np.linspace(0, 1, len(x))
-        x_new = np.linspace(0, 1, target_len)
-        return np.interp(x_new, x_old, x)
-    
-    @staticmethod
-    def find_best_shift(pred, gt, valid_mask, max_shift=50):
-        """找最优时间偏移以最大化相关系数"""
-        pred = np.atleast_1d(pred).flatten()
-        gt = np.atleast_1d(gt).flatten()
-        valid_mask = np.atleast_1d(valid_mask).flatten()
-        
-        # 统一长度
-        target_len = len(gt)
-        pred = ECGSignalAligner.resample_1d(pred, target_len)
-        valid_mask = ECGSignalAligner.resample_1d(valid_mask, target_len)
-        
-        valid_idx = valid_mask > 0.5
-        if valid_idx.sum() < 10:
-            return 0, 0.0
-        
-        best_shift = 0
-        best_corr = -2.0
-        
-        # 搜索时间偏移
-        for shift in range(-max_shift, max_shift + 1):
-            # 滑动预测信号
-            if shift > 0:
-                pred_shifted = np.concatenate([np.zeros(shift), pred[:-shift]])
-            elif shift < 0:
-                pred_shifted = np.concatenate([pred[-shift:], np.zeros(-shift)])
-            else:
-                pred_shifted = pred
-            
-            # 计算相关系数 (仅在有效区间)
-            try:
-                v_pred = pred_shifted[valid_idx]
-                v_gt = gt[valid_idx]
-                
-                if np.var(v_pred) > 1e-6:  # 避免零方差
-                    corr, _ = pearsonr(v_pred, v_gt)
-                else:
-                    corr = 0.0
-            except:
-                corr = 0.0
-            
-            if corr > best_corr:
-                best_corr = corr
-                best_shift = shift
-        
-        return best_shift, best_corr
-    
-    @staticmethod
-    def align_with_optimal_scale(pred, gt, valid_mask, shift=0):
-        """使用最优偏移和缩放对齐信号"""
-        pred = np.atleast_1d(pred).flatten()
-        gt = np.atleast_1d(gt).flatten()
-        valid_mask = np.atleast_1d(valid_mask).flatten()
-        
-        # 统一长度
-        target_len = len(gt)
-        pred = ECGSignalAligner.resample_1d(pred, target_len)
-        valid_mask = ECGSignalAligner.resample_1d(valid_mask, target_len)
-        
-        # 应用时间偏移
-        if shift > 0:
-            pred = np.concatenate([np.zeros(shift), pred[:-shift]])
-        elif shift < 0:
-            pred = np.concatenate([pred[-shift:], np.zeros(-shift)])
-        
-        # 计算有效区间
-        valid_idx = valid_mask > 0.5
-        if valid_idx.sum() < 10:
-            return pred, 0.0, float('inf'), float('inf')
-        
-        v_pred = pred[valid_idx]
-        v_gt = gt[valid_idx]
-        
-        # 最优缩放
-        try:
-            cov_matrix = np.cov(v_pred, v_gt)
-            if cov_matrix.ndim == 2:
-                a = cov_matrix[0, 1] / (np.var(v_pred) + 1e-6)
-            else:
-                a = 1.0
-            b = v_gt.mean() - a * v_pred.mean()
-        except:
-            a, b = 1.0, 0.0
-        
-        # 应用缩放
-        pred_aligned = a * pred + b
-        
-        # 计算指标
-        try:
-            corr, _ = pearsonr(pred_aligned[valid_idx], v_gt)
-        except:
-            corr = 0.0
-        
-        mae = np.abs(pred_aligned[valid_idx] - v_gt).mean()
-        rmse = np.sqrt(((pred_aligned[valid_idx] - v_gt) ** 2).mean())
-        
-        return pred_aligned, corr, mae, rmse
 
 
 # ============ 主类 ============

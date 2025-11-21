@@ -1,269 +1,353 @@
 """
-ECG V48 Model (完全修复版)
+ECG V48 Dataset (完全修复版)
 修复内容:
-1. ✅ 使用可微的 RoI Align 替代整数切片
-2. ✅ 新增波形分割头 (Wave Segmentation Head)
-3. ✅ 新增 OCR 检测头 (Paper Speed & Gain)
-4. ✅ 端到端梯度流动
+1. ✅ 加载 label_wave.npy (波形分割标签)
+2. ✅ 加载 label_auxiliary.npy (辅助标记)
+3. ✅ 加载 OCR 掩码 (paper_speed, gain)
+4. ✅ 使用 metadata.time_range 精确对齐信号
+5. ✅ 优化内存缓存策略
 """
 
+import json
+import numpy as np
+import cv2
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torchvision.models import resnet50, ResNet50_Weights
-from torchvision.ops import roi_align
-from typing import Dict, Optional
+from pathlib import Path
+from torch.utils.data import Dataset
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from PIL import Image
+from typing import Tuple, Dict, Optional
+import warnings
 
-class CRNNLeadDecoder(nn.Module):
-    """CRNN 解码器: 特征图 → 1D 信号"""
-    def __init__(self, in_channels=256, hidden_size=128, roi_height=32, dropout=0.2):
-        super().__init__()
+class ECGV48FixedDataset(Dataset):
+    def __init__(self,
+                 sim_root_dir: str,
+                 csv_root_dir: str,
+                 split: str = 'train',
+                 target_size: Tuple[int, int] = (512, 2048),
+                 target_fs: int = 500,
+                 max_samples: Optional[int] = None,
+                 augment: bool = False,
+                 cache_images: bool = True):
         
-        # CNN: 垂直压缩
-        self.cnn = nn.Sequential(
-            nn.Conv2d(in_channels, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(True),
-            nn.MaxPool2d((2, 1)),  # H/2
-            nn.Conv2d(128, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(True),
-            nn.MaxPool2d((2, 1)),  # H/4
-            nn.Conv2d(64, 64, (roi_height // 4, 1)), nn.BatchNorm2d(64), nn.ReLU(True)
-        )
+        self.sim_root = Path(sim_root_dir)
+        self.csv_root = Path(csv_root_dir)
+        self.split = split
+        self.target_size = target_size
+        self.target_fs = target_fs
+        self.augment = augment
+        self.cache_images = cache_images
         
-        # RNN: 水平时序建模
-        self.rnn = nn.GRU(64, hidden_size, num_layers=2, batch_first=True, bidirectional=True)
+        self.cache = {}
+        self.lead_names = ['I', 'II', 'III', 'aVR', 'aVL', 'aVF', 
+                           'V1', 'V2', 'V3', 'V4', 'V5', 'V6']
         
-        # 回归头
-        self.head = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size * 2, 64),
-            nn.ReLU(True),
-            nn.Linear(64, 1)
-        )
+        self.samples = self._scan_samples(max_samples)
+        self.transform = self._build_transform()
 
-    def forward(self, x):
-        # x: (B*12, C, H, W)
-        feat = self.cnn(x)  # (B*12, 64, 1, W)
-        feat = feat.squeeze(2).permute(0, 2, 1)  # (B*12, W, 64)
-        rnn_out, _ = self.rnn(feat)
-        signal = self.head(rnn_out).squeeze(-1)  # (B*12, W)
-        return signal
+        print(f"\n{'='*60}")
+        print(f"ECG Dataset V48 Fixed ({split})")
+        print(f"Samples: {len(self.samples)}")
+        print(f"Target Size: {target_size}")
+        print(f"Image Cache: {'✅ ON' if cache_images else '⚠️ OFF'}")
+        print(f"{'='*60}\n")
 
+    def _scan_samples(self, max_samples):
+        samples = []
+        if not self.sim_root.exists():
+            warnings.warn(f"Sim root not found: {self.sim_root}")
+            return []
+        
+        dirs = sorted([d for d in self.sim_root.iterdir() if d.is_dir()])
+        for d in dirs:
+            sid = d.name
+            required_files = [
+                f"{sid}_dirty.png",
+                f"{sid}_gt_signals.json",
+                f"{sid}_metadata.json"
+            ]
+            if all((d / f).exists() for f in required_files):
+                samples.append({'id': sid, 'dir': d})
+            if max_samples and len(samples) >= max_samples:
+                break
+        return samples
 
-class ProgressiveLeadLocalizationModelV48(nn.Module):
-    """
-    ECG 渐进式定位与读取模型 V48 (完全修复版)
-    """
-    def __init__(self, num_leads=12, roi_height=32, pretrained=True):
-        super().__init__()
-        self.num_leads = num_leads
-        self.roi_height = roi_height
-        
-        # ========== 1. Backbone (ResNet50 + FPN) ==========
-        backbone = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1 if pretrained else None)
-        
-        self.enc0 = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool)
-        self.enc1 = backbone.layer1
-        self.enc2 = backbone.layer2
-        self.enc3 = backbone.layer3
-        self.enc4 = backbone.layer4
-        
-        # FPN 侧连接
-        self.lat4 = nn.Conv2d(2048, 256, 1)
-        self.lat3 = nn.Conv2d(1024, 256, 1)
-        self.lat2 = nn.Conv2d(512, 256, 1)
-        self.lat1 = nn.Conv2d(256, 256, 1)
-        
-        self.smooth = nn.Conv2d(256, 256, 3, padding=1)
-        
-        # ========== 2. 定位头 (Localization Heads) ==========
-        # 粗基线 (H/16)
-        self.head_coarse = nn.Sequential(
-            nn.Conv2d(256, 128, 3, padding=1), nn.ReLU(True),
-            nn.Conv2d(128, 1, 1), nn.Sigmoid()
-        )
-        
-        # 文字掩码 (13 通道: background + 12 leads)
-        self.head_text = nn.Sequential(
-            nn.Conv2d(256, 128, 3, padding=1), nn.ReLU(True),
-            nn.Conv2d(128, 13, 1), nn.Sigmoid()
-        )
-        
-        # 🆕 波形分割头 (12 通道: 每个导联独立)
-        self.head_wave_seg = nn.Sequential(
-            nn.Conv2d(256, 128, 3, padding=1), nn.ReLU(True),
-            nn.Conv2d(128, num_leads, 1)  # 输出 logits (不加 Sigmoid)
-        )
-        
-        # 🆕 OCR 检测头
-        self.head_ocr = nn.Sequential(
-            nn.Conv2d(256, 64, 3, padding=1), nn.ReLU(True),
-            nn.Conv2d(64, 2, 1), nn.Sigmoid()  # [paper_speed, gain]
-        )
-        
-        # 精细基线融合 (12 通道: 每个导联独立)
-        self.head_fusion = nn.Sequential(
-            nn.Conv2d(256 + 1 + 13, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(True),
-            nn.Conv2d(256, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(True),
-            nn.Conv2d(128, num_leads, 1), nn.Sigmoid()
-        )
-        
-        # ========== 3. 信号解码器 ==========
-        self.decoder = CRNNLeadDecoder(in_channels=256, roi_height=roi_height)
+    def _build_transform(self):
+        if self.augment:
+            return A.Compose([
+                A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.05, p=0.4),
+                A.GaussNoise(var_limit=(5.0, 15.0), p=0.3),
+                A.CoarseDropout(max_holes=8, max_height=40, max_width=40, p=0.3),
+                A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                ToTensorV2()
+            ])
+        else:
+            return A.Compose([
+                A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                ToTensorV2()
+            ])
 
-    def extract_rois_differentiable(self, feature_map, baselines):
-        """
-        🔥 关键修复: 使用可微的 RoI Align
-        """
-        B, C, H, W = feature_map.shape
-        device = feature_map.device
-        
-        # 1. 计算每个导联的中心 Y 坐标 (保留梯度)
-        y_dist = baselines.mean(dim=3)  # (B, 12, H)
-        pixel_pos = torch.arange(H, device=device, dtype=torch.float32).view(1, 1, H)
-        centers_y = (y_dist * pixel_pos).sum(dim=2) / (y_dist.sum(dim=2) + 1e-6)  # (B, 12)
-        
-        # 2. 构建 RoI boxes: [x1, y1, x2, y2] (归一化坐标 [0, 1])
-        half_h = self.roi_height / 2.0
-        boxes_list = []
-        
-        for b in range(B):
-            for l in range(self.num_leads):
-                y_c = centers_y[b, l]
-                # 限制边界
-                y_top = torch.clamp(y_c - half_h, 0, H - 1)
-                y_bot = torch.clamp(y_c + half_h, 0, H - 1)
-                
-                # 归一化到 [0, 1]
-                box = torch.stack([
-                    torch.tensor(0.0, device=device),      # x1 = 0
-                    y_top / H,                              # y1
-                    torch.tensor(1.0, device=device),      # x2 = W
-                    y_bot / H                               # y2
-                ])
-                boxes_list.append(box)
-        
-        boxes = torch.stack(boxes_list)  # (B*12, 4)
-        
-        # 3. 可微 RoI Align
-        # 需要添加 batch_index 列
-        batch_indices = torch.arange(B, device=device).repeat_interleave(self.num_leads).float()
-        boxes_with_idx = torch.cat([batch_indices.unsqueeze(1), boxes], dim=1)  # (B*12, 5)
-        
-        # roi_align 需要 boxes 格式: List[Tensor] 或 Tensor
-        # 这里手动实现一个简化版本，避免 torchvision 版本问题
-        rois = []
-        for b in range(B):
-            for l in range(self.num_leads):
-                idx = b * self.num_leads + l
-                y_start = int(boxes[idx, 1].item() * H)
-                y_end = int(boxes[idx, 3].item() * H)
-                
-                # 使用 grid_sample 进行可微裁剪
-                # 构造采样网格
-                grid_h = torch.linspace(-1, 1, self.roi_height, device=device)
-                grid_w = torch.linspace(-1, 1, W, device=device)
-                grid_y, grid_x = torch.meshgrid(grid_h, grid_w, indexing='ij')
-                
-                # 映射到原始特征图坐标
-                y_center = (y_start + y_end) / 2.0
-                y_scale = (y_end - y_start) / H
-                
-                # 归一化坐标 [-1, 1]
-                grid_y_mapped = grid_y * y_scale + (2.0 * y_center / H - 1.0)
-                
-                grid = torch.stack([grid_x, grid_y_mapped], dim=-1).unsqueeze(0)  # (1, H_roi, W, 2)
-                
-                # 采样
-                roi = F.grid_sample(
-                    feature_map[b:b+1], grid, 
-                    mode='bilinear', padding_mode='zeros', align_corners=False
-                )  # (1, C, H_roi, W)
-                
-                rois.append(roi.squeeze(0))
-        
-        rois = torch.stack(rois, dim=0)  # (B*12, C, H_roi, W)
-        return rois
+    def __len__(self):
+        return len(self.samples)
 
-    def forward(self, x, return_signals=True):
-        """
-        前向传播
-        """
-        B = x.shape[0]
+    def _load_file(self, file_path, file_type, sample_id):
+        """带缓存的文件加载"""
+        cache_key = f"{sample_id}_{file_path.name}"
         
-        # ========== Encoder & FPN ==========
-        c1 = self.enc0(x)
-        c2 = self.enc1(c1)
-        c3 = self.enc2(c2)
-        c4 = self.enc3(c3)
-        c5 = self.enc4(c4)
+        if cache_key in self.cache:
+            return self.cache[cache_key]
         
-        p5 = self.lat4(c5)
-        p4 = self.lat3(c4) + F.interpolate(p5, scale_factor=2, mode='nearest')
-        p3 = self.lat2(c3) + F.interpolate(p4, scale_factor=2, mode='nearest')
-        p2 = self.lat1(c2) + F.interpolate(p3, scale_factor=2, mode='nearest')
+        data = None
+        try:
+            if file_type == 'json':
+                with open(file_path, 'r') as f:
+                    data = json.load(f)
+            elif file_type == 'npy':
+                if file_path.exists():
+                    data = np.load(file_path)
+            elif file_type == 'img':
+                data = np.array(Image.open(file_path).convert('RGB'))
+        except Exception as e:
+            warnings.warn(f"Failed to load {file_path}: {e}")
+            return None
+            
+        # 缓存策略
+        if data is not None:
+            if file_type == 'img':
+                if self.cache_images:
+                    self.cache[cache_key] = data
+            else:
+                self.cache[cache_key] = data
+            
+        return data
+
+    def __getitem__(self, idx):
+        sample_info = self.samples[idx]
+        sid = sample_info['id']
+        sdir = sample_info['dir']
         
-        d2 = self.smooth(p2)  # H/4
-        d4 = F.avg_pool2d(d2, kernel_size=4, stride=4)  # H/16
+        h_tg, w_tg = self.target_size
         
-        # ========== 定位头输出 ==========
-        coarse = self.head_coarse(d4)  # (B, 1, H/16, W/16)
-        text = self.head_text(d2)      # (B, 13, H/4, W/4)
-        wave_seg = self.head_wave_seg(d2)  # (B, 12, H/4, W/4) logits
-        ocr = self.head_ocr(d2)        # (B, 2, H/4, W/4)
+        # ========== 1. 加载图像 ==========
+        img_path = sdir / f"{sid}_dirty.png"
+        image = self._load_file(img_path, 'img', sid)
+        if image is None:
+            raise RuntimeError(f"Failed to load image: {img_path}")
+        orig_h, orig_w = image.shape[:2]
         
-        # 融合生成精细基线
-        coarse_up = F.interpolate(coarse, size=d2.shape[-2:], mode='bilinear', align_corners=False)
-        fusion_in = torch.cat([d2, coarse_up, text], dim=1)
-        baselines = self.head_fusion(fusion_in)  # (B, 12, H/4, W/4)
+        # ========== 2. 加载元数据 ==========
+        meta = self._load_file(sdir / f"{sid}_metadata.json", 'json', sid)
+        phys_params = meta.get('physical_params', {})
+        gain = phys_params.get('gain_mm_mv', 10.0)
+        speed = phys_params.get('paper_speed_mm_s', 25.0)
+        lead_rois = meta.get('lead_rois', {})
         
-        outputs = {
-            'coarse_baseline': coarse,
-            'text_masks': text,
-            'wave_segmentation_logits': wave_seg,
-            'ocr_maps': ocr,
-            'lead_baselines': baselines
+        # ========== 3. 加载基线掩码 (12, H, W) ==========
+        baseline_raw = self._load_file(sdir / f"{sid}_label_baseline.npy", 'npy', sid)
+        if baseline_raw is not None and baseline_raw.shape[0] == 12:
+            baseline_resized = np.zeros((12, h_tg, w_tg), dtype=np.float32)
+            for i in range(12):
+                baseline_resized[i] = cv2.resize(baseline_raw[i], (w_tg, h_tg), 
+                                                  interpolation=cv2.INTER_LINEAR) / 255.0
+        else:
+            baseline_resized = np.zeros((12, h_tg, w_tg), dtype=np.float32)
+            
+        # ========== 4. 加载文字掩码 (13, H, W) ==========
+        text_raw = self._load_file(sdir / f"{sid}_label_text_multi.npy", 'npy', sid)
+        if text_raw is not None and text_raw.shape[0] == 13:
+            text_resized = np.zeros((13, h_tg, w_tg), dtype=np.float32)
+            for i in range(13):
+                text_resized[i] = cv2.resize(text_raw[i], (w_tg, h_tg), 
+                                              interpolation=cv2.INTER_NEAREST) / 255.0
+        else:
+            text_resized = np.zeros((13, h_tg, w_tg), dtype=np.float32)
+
+        # ========== 5. 🆕 加载波形分割掩码 (H, W) ==========
+        wave_seg_raw = self._load_file(sdir / f"{sid}_label_wave.npy", 'npy', sid)
+        if wave_seg_raw is not None:
+            wave_seg_resized = cv2.resize(wave_seg_raw, (w_tg, h_tg), 
+                                           interpolation=cv2.INTER_NEAREST)
+        else:
+            wave_seg_resized = np.zeros((h_tg, w_tg), dtype=np.uint8)
+            
+        # ========== 6. 🆕 加载辅助掩码 (1, H, W) ==========
+        aux_raw = self._load_file(sdir / f"{sid}_label_auxiliary.npy", 'npy', sid)
+        if aux_raw is not None and len(aux_raw.shape) == 3:
+            aux_resized = cv2.resize(aux_raw[0], (w_tg, h_tg), 
+                                      interpolation=cv2.INTER_LINEAR) / 255.0
+        else:
+            aux_resized = np.zeros((h_tg, w_tg), dtype=np.float32)
+            
+        # ========== 7. 🆕 加载 OCR 掩码 ==========
+        ps_raw = self._load_file(sdir / f"{sid}_label_paper_speed.npy", 'npy', sid)
+        if ps_raw is not None and len(ps_raw.shape) == 3:
+            ps_resized = cv2.resize(ps_raw[0], (w_tg, h_tg), 
+                                     interpolation=cv2.INTER_LINEAR) / 255.0
+        else:
+            ps_resized = np.zeros((h_tg, w_tg), dtype=np.float32)
+            
+        gain_raw = self._load_file(sdir / f"{sid}_label_gain.npy", 'npy', sid)
+        if gain_raw is not None and len(gain_raw.shape) == 3:
+            gain_resized = cv2.resize(gain_raw[0], (w_tg, h_tg), 
+                                       interpolation=cv2.INTER_LINEAR) / 255.0
+        else:
+            gain_resized = np.zeros((h_tg, w_tg), dtype=np.float32)
+
+        # ========== 8. 🆕 精确信号对齐 (使用 time_range) ==========
+        gt_data = self._load_file(sdir / f"{sid}_gt_signals.json", 'json', sid)
+        
+        feature_width = w_tg // 4  # 特征图宽度
+        target_signals = np.zeros((12, feature_width), dtype=np.float32)
+        valid_mask = np.zeros((12, feature_width), dtype=np.float32)
+        
+        for i, lead in enumerate(self.lead_names):
+            # 从 GT JSON 加载原始信号
+            raw_sig = gt_data['signals'].get(lead, None)
+            if raw_sig is None or len(raw_sig) == 0:
+                continue
+            raw_sig = np.array(raw_sig, dtype=np.float32)
+            
+            # 🔥 关键修复: 使用 metadata 的 time_range
+            if lead in lead_rois and lead_rois[lead] is not None:
+                time_range = lead_rois[lead].get('time_range', [0.0, 2.5])
+            else:
+                time_range = [0.0, 2.5]  # 默认短导联
+            
+            time_start, time_end = time_range
+            duration = time_end - time_start
+            
+            # 计算信号在特征图上的起止位置
+            # 根据时间比例映射到特征图宽度
+            total_duration = 10.0  # 假设整个图像横跨 10 秒 (长导联的时长)
+            start_ratio = time_start / total_duration
+            end_ratio = time_end / total_duration
+            
+            start_idx = int(start_ratio * feature_width)
+            end_idx = int(end_ratio * feature_width)
+            segment_len = end_idx - start_idx
+            
+            if segment_len > 0:
+                # 重采样信号到特征图长度
+                x_old = np.linspace(0, 1, len(raw_sig))
+                x_new = np.linspace(0, 1, segment_len)
+                resampled = np.interp(x_new, x_old, raw_sig)
+                
+                # 填充到目标数组
+                target_signals[i, start_idx:end_idx] = resampled
+                valid_mask[i, start_idx:end_idx] = 1.0
+            
+        # ========== 9. 图像增强与转换 ==========
+        img_resized = cv2.resize(image, (w_tg, h_tg), interpolation=cv2.INTER_LINEAR)
+        img_tensor = self.transform(image=img_resized)['image']
+        
+        # ========== 10. 返回完整数据 ==========
+        return {
+            'image': img_tensor,  # (3, H, W)
+            
+            # 分割标签
+            'baseline_mask': torch.from_numpy(baseline_resized).float(),  # (12, H, W)
+            'text_mask': torch.from_numpy(text_resized).float(),          # (13, H, W)
+            'wave_segmentation': torch.from_numpy(wave_seg_resized).long(),  # (H, W)
+            'auxiliary_mask': torch.from_numpy(aux_resized).float(),      # (H, W)
+            
+            # OCR 标签
+            'paper_speed_mask': torch.from_numpy(ps_resized).float(),     # (H, W)
+            'gain_mask': torch.from_numpy(gain_resized).float(),          # (H, W)
+            
+            # 信号回归标签
+            'gt_signals': torch.from_numpy(target_signals).float(),       # (12, W/4)
+            'valid_mask': torch.from_numpy(valid_mask).float(),           # (12, W/4)
+            
+            # 元数据
+            'metadata': {
+                'ecg_id': str(sid),
+                'gain': float(gain),
+                'speed': float(speed)
+            }
         }
-        
-        # ========== 信号解码 ==========
-        if self.training or return_signals:
-            # 1. 提取 ROIs (可微)
-            lead_rois = self.extract_rois_differentiable(d2, baselines)
-            
-            # 2. CRNN 解码
-            raw_signals = self.decoder(lead_rois)
-            
-            # 3. Reshape
-            outputs['signals'] = raw_signals.view(B, self.num_leads, -1)
-        
-        return outputs
 
 
-# ========== 模块测试 ==========
+def create_dataloaders(sim_root, csv_root, batch_size=8, num_workers=4, 
+                       train_split=0.9, **kwargs):
+    """
+    创建训练和验证 DataLoader
+    """
+    # 清理参数
+    augment_flag = kwargs.pop('augment', None)
+    cache_flag = kwargs.pop('cache_data', True)
+    
+    # 创建数据集
+    train_ds = ECGV48FixedDataset(
+        sim_root, csv_root, split='train', 
+        augment=True,  # 训练集开启增强
+        cache_images=cache_flag,
+        **kwargs
+    )
+    
+    val_ds = ECGV48FixedDataset(
+        sim_root, csv_root, split='val',
+        augment=False,  # 验证集关闭增强
+        cache_images=cache_flag,
+        **kwargs
+    )
+    
+    # 划分训练/验证集
+    dataset_size = len(train_ds)
+    indices = list(range(dataset_size))
+    split_idx = int(np.floor(train_split * dataset_size))
+    
+    np.random.seed(42)
+    np.random.shuffle(indices)
+    train_indices, val_indices = indices[:split_idx], indices[split_idx:]
+    
+    print(f"Dataset Split: Train={len(train_indices)}, Val={len(val_indices)}")
+    
+    train_subset = torch.utils.data.Subset(train_ds, train_indices)
+    val_subset = torch.utils.data.Subset(val_ds, val_indices)
+    
+    # DataLoader 配置
+    worker_count = num_workers if num_workers > 0 else 0
+    prefetch = 4 if worker_count > 0 else None
+    
+    train_loader = torch.utils.data.DataLoader(
+        train_subset, batch_size=batch_size, shuffle=True,
+        num_workers=worker_count, pin_memory=True, drop_last=True,
+        persistent_workers=(worker_count > 0), prefetch_factor=prefetch
+    )
+    
+    val_loader = torch.utils.data.DataLoader(
+        val_subset, batch_size=batch_size, shuffle=False,
+        num_workers=worker_count, pin_memory=True, drop_last=False,
+        persistent_workers=(worker_count > 0), prefetch_factor=prefetch
+    )
+    
+    return train_loader, val_loader
+
+
 if __name__ == "__main__":
-    print("Testing ECG Model V48...")
+    import argparse
     
-    model = ProgressiveLeadLocalizationModelV48(num_leads=12, pretrained=False)
-    model.eval()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--sim_root', type=str, required=True)
+    parser.add_argument('--csv_root', type=str, required=True)
+    args = parser.parse_args()
     
-    x = torch.randn(2, 3, 512, 2048)
-    print(f"Input: {x.shape}")
-    
-    with torch.no_grad():
-        out = model(x)
-    
-    print("\nOutput Shapes:")
-    for k, v in out.items():
-        if isinstance(v, torch.Tensor):
-            print(f"  {k}: {v.shape}")
-    
-    # 验证梯度流动
-    print("\n Testing gradient flow...")
-    model.train()
-    out = model(x)
-    loss = out['signals'].sum()
-    loss.backward()
-    
-    # 检查 baseline head 的梯度
-    has_grad = any(p.grad is not None for p in model.head_fusion.parameters())
-    print(f"  Baseline head has gradient: {has_grad}")
-    
-    print("\n✓ Model test passed!")
+    if Path(args.sim_root).exists():
+        print("Testing dataset...")
+        loader, _ = create_dataloaders(
+            args.sim_root, args.csv_root, 
+            batch_size=2, max_samples=10
+        )
+        
+        for batch in loader:
+            print("\nBatch keys:", batch.keys())
+            print(f"Image: {batch['image'].shape}")
+            print(f"Baseline: {batch['baseline_mask'].shape}")
+            print(f"Wave Seg: {batch['wave_segmentation'].shape}")
+            print(f"Auxiliary: {batch['auxiliary_mask'].shape}")
+            print(f"Signals: {batch['gt_signals'].shape}")
+            print(f"Valid Mask: {batch['valid_mask'].shape}")
+            break
+        
+        print("\n✓ Dataset test passed!")

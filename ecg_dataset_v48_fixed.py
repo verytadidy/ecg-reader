@@ -4,7 +4,7 @@ ECG V48 Dataset (完全修复版)
 1. ✅ 加载 label_wave.npy (波形分割标签)
 2. ✅ 加载 label_auxiliary.npy (辅助标记)
 3. ✅ 加载 OCR 掩码 (paper_speed, gain)
-4. ✅ 使用 metadata.time_range 精确对齐信号
+4. ✅ 使用 metadata.time_range 精确对齐信号 【P0 修复】
 5. ✅ 优化内存缓存策略
 """
 
@@ -29,7 +29,7 @@ class ECGV48FixedDataset(Dataset):
                  target_fs: int = 500,
                  max_samples: Optional[int] = None,
                  augment: bool = False,
-                 cache_images: bool = True):
+                 cache_images: bool = False):
         
         self.sim_root = Path(sim_root_dir)
         self.csv_root = Path(csv_root_dir)
@@ -38,6 +38,7 @@ class ECGV48FixedDataset(Dataset):
         self.target_fs = target_fs
         self.augment = augment
         self.cache_images = cache_images
+        self.cache_size_limit = 50
         
         self.cache = {}
         self.lead_names = ['I', 'II', 'III', 'aVR', 'aVL', 'aVF', 
@@ -112,13 +113,18 @@ class ECGV48FixedDataset(Dataset):
             warnings.warn(f"Failed to load {file_path}: {e}")
             return None
             
-        # 缓存策略
         if data is not None:
             if file_type == 'img':
                 if self.cache_images:
                     self.cache[cache_key] = data
             else:
                 self.cache[cache_key] = data
+        
+        if len(self.cache) > self.cache_size_limit:
+            remove_count = int(self.cache_size_limit * 0.3)
+            keys = list(self.cache.keys())
+            for k in keys[:remove_count]:
+                del self.cache[k]
             
         return data
 
@@ -163,7 +169,7 @@ class ECGV48FixedDataset(Dataset):
         else:
             text_resized = np.zeros((13, h_tg, w_tg), dtype=np.float32)
 
-        # ========== 5. 🆕 加载波形分割掩码 (H, W) ==========
+        # ========== 5. 加载波形分割掩码 (H, W) ==========
         wave_seg_raw = self._load_file(sdir / f"{sid}_label_wave.npy", 'npy', sid)
         if wave_seg_raw is not None:
             wave_seg_resized = cv2.resize(wave_seg_raw, (w_tg, h_tg), 
@@ -171,7 +177,7 @@ class ECGV48FixedDataset(Dataset):
         else:
             wave_seg_resized = np.zeros((h_tg, w_tg), dtype=np.uint8)
             
-        # ========== 6. 🆕 加载辅助掩码 (1, H, W) ==========
+        # ========== 6. 加载辅助掩码 (1, H, W) ==========
         aux_raw = self._load_file(sdir / f"{sid}_label_auxiliary.npy", 'npy', sid)
         if aux_raw is not None and len(aux_raw.shape) == 3:
             aux_resized = cv2.resize(aux_raw[0], (w_tg, h_tg), 
@@ -179,7 +185,7 @@ class ECGV48FixedDataset(Dataset):
         else:
             aux_resized = np.zeros((h_tg, w_tg), dtype=np.float32)
             
-        # ========== 7. 🆕 加载 OCR 掩码 ==========
+        # ========== 7. 加载 OCR 掩码 ==========
         ps_raw = self._load_file(sdir / f"{sid}_label_paper_speed.npy", 'npy', sid)
         if ps_raw is not None and len(ps_raw.shape) == 3:
             ps_resized = cv2.resize(ps_raw[0], (w_tg, h_tg), 
@@ -194,12 +200,16 @@ class ECGV48FixedDataset(Dataset):
         else:
             gain_resized = np.zeros((h_tg, w_tg), dtype=np.float32)
 
-        # ========== 8. 🆕 精确信号对齐 (使用 time_range) ==========
+        # ========== 8. 🔥 P0 修复：精确信号对齐 ==========
         gt_data = self._load_file(sdir / f"{sid}_gt_signals.json", 'json', sid)
         
         feature_width = w_tg // 4  # 特征图宽度
         target_signals = np.zeros((12, feature_width), dtype=np.float32)
         valid_mask = np.zeros((12, feature_width), dtype=np.float32)
+        
+        # 计算原始图像到特征图的缩放比例
+        scale_x = feature_width / orig_w
+        scale_y = h_tg / orig_h  # 虽然用不到，但保持一致性
         
         for i, lead in enumerate(self.lead_names):
             # 从 GT JSON 加载原始信号
@@ -208,24 +218,35 @@ class ECGV48FixedDataset(Dataset):
                 continue
             raw_sig = np.array(raw_sig, dtype=np.float32)
             
-            # 🔥 关键修复: 使用 metadata 的 time_range
+            # 🔥 修复关键点：使用 RoI bbox 的实际宽度
             if lead in lead_rois and lead_rois[lead] is not None:
-                time_range = lead_rois[lead].get('time_range', [0.0, 2.5])
+                roi_bbox = lead_rois[lead].get('bbox', None)
             else:
-                time_range = [0.0, 2.5]  # 默认短导联
+                roi_bbox = None
             
-            time_start, time_end = time_range
-            duration = time_end - time_start
+            if roi_bbox is None:
+                # 如果没有 bbox，跳过该导联
+                warnings.warn(f"Lead {lead} missing bbox in metadata")
+                continue
             
-            # 计算信号在特征图上的起止位置
-            # 根据时间比例映射到特征图宽度
-            total_duration = 10.0  # 假设整个图像横跨 10 秒 (长导联的时长)
-            start_ratio = time_start / total_duration
-            end_ratio = time_end / total_duration
+            # bbox 格式: [x1, y1, x2, y2] (原始图像坐标)
+            x1_orig, y1_orig, x2_orig, y2_orig = roi_bbox
             
-            start_idx = int(start_ratio * feature_width)
-            end_idx = int(end_ratio * feature_width)
-            segment_len = end_idx - start_idx
+            # 转换到特征图坐标
+            x1_feat = int(x1_orig * scale_x)
+            x2_feat = int(x2_orig * scale_x)
+            
+            # 特征图上的导联宽度
+            segment_len = x2_feat - x1_feat
+            
+            if segment_len <= 0:
+                warnings.warn(f"Lead {lead} has invalid segment length: {segment_len}")
+                continue
+            
+            # 确保不越界
+            x1_feat = max(0, x1_feat)
+            x2_feat = min(feature_width, x2_feat)
+            segment_len = x2_feat - x1_feat
             
             if segment_len > 0:
                 # 重采样信号到特征图长度
@@ -234,8 +255,8 @@ class ECGV48FixedDataset(Dataset):
                 resampled = np.interp(x_new, x_old, raw_sig)
                 
                 # 填充到目标数组
-                target_signals[i, start_idx:end_idx] = resampled
-                valid_mask[i, start_idx:end_idx] = 1.0
+                target_signals[i, x1_feat:x2_feat] = resampled
+                valid_mask[i, x1_feat:x2_feat] = 1.0
             
         # ========== 9. 图像增强与转换 ==========
         img_resized = cv2.resize(image, (w_tg, h_tg), interpolation=cv2.INTER_LINEAR)
@@ -263,7 +284,8 @@ class ECGV48FixedDataset(Dataset):
             'metadata': {
                 'ecg_id': str(sid),
                 'gain': float(gain),
-                'speed': float(speed)
+                'speed': float(speed),
+                'orig_size': (orig_h, orig_w)  # 🔥 新增：原始图像尺寸
             }
         }
 
@@ -273,26 +295,23 @@ def create_dataloaders(sim_root, csv_root, batch_size=8, num_workers=4,
     """
     创建训练和验证 DataLoader
     """
-    # 清理参数
     augment_flag = kwargs.pop('augment', None)
     cache_flag = kwargs.pop('cache_data', True)
     
-    # 创建数据集
     train_ds = ECGV48FixedDataset(
         sim_root, csv_root, split='train', 
-        augment=True,  # 训练集开启增强
+        augment=True,
         cache_images=cache_flag,
         **kwargs
     )
     
     val_ds = ECGV48FixedDataset(
         sim_root, csv_root, split='val',
-        augment=False,  # 验证集关闭增强
+        augment=False,
         cache_images=cache_flag,
         **kwargs
     )
     
-    # 划分训练/验证集
     dataset_size = len(train_ds)
     indices = list(range(dataset_size))
     split_idx = int(np.floor(train_split * dataset_size))
@@ -306,7 +325,6 @@ def create_dataloaders(sim_root, csv_root, batch_size=8, num_workers=4,
     train_subset = torch.utils.data.Subset(train_ds, train_indices)
     val_subset = torch.utils.data.Subset(val_ds, val_indices)
     
-    # DataLoader 配置
     worker_count = num_workers if num_workers > 0 else 0
     prefetch = 4 if worker_count > 0 else None
     
@@ -348,6 +366,11 @@ if __name__ == "__main__":
             print(f"Auxiliary: {batch['auxiliary_mask'].shape}")
             print(f"Signals: {batch['gt_signals'].shape}")
             print(f"Valid Mask: {batch['valid_mask'].shape}")
+            
+            # 🔥 验证信号对齐
+            for i in range(12):
+                valid_ratio = batch['valid_mask'][0, i].sum() / batch['valid_mask'][0, i].numel()
+                print(f"  Lead {i}: {valid_ratio:.2%} valid pixels")
             break
         
         print("\n✓ Dataset test passed!")

@@ -20,9 +20,9 @@ SIM_ROOT="/Volumes/movie/work/physionet-ecg-image-digitization-simulations-V47"
 CSV_ROOT="/Volumes/movie/work/physionet-ecg-image-digitization/train"
 
 # 训练参数
-EPOCHS=50
-WARMUP_EPOCHS=10        # V48 新增：权重调度 warmup
-BATCH_SIZE=8
+EPOCHS=20
+WARMUP_EPOCHS=0        # V48 新增：权重调度 warmup
+BATCH_SIZE=6
 LR=1e-4
 NUM_WORKERS=4
 TARGET_FS=500
@@ -67,6 +67,30 @@ print_error() {
 
 print_cyan() {
     echo -e "${CYAN}$1${NC}"
+}
+
+quick_check_v48_data() {
+    local sim_root="$1"
+    local sample_limit=5
+    
+    echo "快速检查 V48 数据..."
+    
+    local sample_dir=$(find "$sim_root" -maxdepth 2 -type d -name "[a-zA-Z0-9]*" 2>/dev/null | head -1)
+    [ -z "$sample_dir" ] && return 1
+    
+    local sample_id=$(basename "$sample_dir")
+    echo "✓ 样本: $sample_id"
+    
+    # 检查基础文件
+    for file in dirty.png gt_signals.json metadata.json; do
+        [ -f "$sample_dir/${sample_id}_$file" ] && echo "  ✓ $file" || echo "  ✗ $file"
+    done
+    
+    # 快速估算总数
+    local quick_count=$(find "$sim_root" -maxdepth 3 -name "*_gt_signals.json" 2>/dev/null | wc -l)
+    echo "  📊 样本数: ~$quick_count"
+    
+    return 0
 }
 
 # 检查必需文件
@@ -165,29 +189,12 @@ check_requirements() {
     echo "检查V48数据完整性..."
     
     # 检查关键文件
-    GT_COUNT=$(find "$SIM_ROOT" -maxdepth 2 -name "*_gt_signals.json" 2>/dev/null | wc -l)
-    WAVE_COUNT=$(find "$SIM_ROOT" -maxdepth 2 -name "*_label_wave.npy" 2>/dev/null | wc -l)
-    AUX_COUNT=$(find "$SIM_ROOT" -maxdepth 2 -name "*_label_auxiliary.npy" 2>/dev/null | wc -l)
-    
-    if [ "$GT_COUNT" -eq 0 ]; then
-        print_error "未找到 *_gt_signals.json 文件"
-        echo "请确认 SIM_ROOT 指向正确的数据集"
+    if ! quick_check_v48_data "$SIM_ROOT"; then
+        print_error "数据验证失败"
         exit 1
     fi
-    print_info "找到 $GT_COUNT 个样本"
-    
-    if [ "$WAVE_COUNT" -eq 0 ]; then
-        print_warning "未找到 *_label_wave.npy (V48 关键文件)"
-        echo "这可能是旧版数据集，建议重新生成"
-    else
-        print_info "波形分割标签: $WAVE_COUNT 个文件"
-    fi
-    
-    if [ "$AUX_COUNT" -eq 0 ]; then
-        print_warning "未找到 *_label_auxiliary.npy"
-    else
-        print_info "辅助掩码标签: $AUX_COUNT 个文件"
-    fi
+
+
     
     echo ""
 }
@@ -232,7 +239,6 @@ debug_train() {
     echo "  Epochs: 5"
     echo "  Warmup: 2"
     echo "  Batch Size: 4"
-    echo "  Workers: 0"
     echo "  Workers: 0"
     echo ""
     
@@ -360,7 +366,6 @@ resume_train() {
     
     echo ""
     read -p "是否恢复训练？[y/N] " yn
-    read -p "是否恢复训练？[y/N] " yn
     case $yn in
         [Yy]*)
             python ecg_train_v48_fixed.py \
@@ -375,8 +380,7 @@ resume_train() {
                 --num_workers $NUM_WORKERS \
                 --input_size $INPUT_SIZE \
                 --target_fs $TARGET_FS \
-                --weight_seg $WEIGHT_SEG \
-                --weight_signal $WEIGHT_SIGNAL
+                --prefetch_factor 2  
             
             if [ $? -eq 0 ]; then
                 print_info "训练完成！"

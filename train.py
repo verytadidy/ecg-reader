@@ -44,6 +44,7 @@ class ECGTrainer:
             target_size=tuple(args.input_size),
             target_fs=args.target_fs,
             max_samples=args.max_samples,
+            cache_data=False,
             augment=True
         )
         

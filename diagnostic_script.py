@@ -115,8 +115,8 @@ def diagnose_resampling(signals_pred, signals_gt, valid_mask):
     
     # 第一条导联详细分析
     pred = signals_pred[0]  # 一维
-    gt = signals_gt[0].numpy()
-    valid = valid_mask[0].numpy()
+    gt = signals_gt[0] if isinstance(signals_gt, np.ndarray) else signals_gt[0].numpy()
+    valid = valid_mask[0] if isinstance(valid_mask, np.ndarray) else valid_mask[0].numpy()
     
     print(f"\n【第一条导联详细分析】")
     print(f"  预测长度: {len(pred)}")
